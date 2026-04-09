@@ -1,0 +1,3 @@
+anthropic>=0.54.0
+pytest>=8.4.0
+slack-bolt>=1.24.0
