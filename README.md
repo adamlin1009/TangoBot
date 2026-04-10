@@ -7,6 +7,7 @@ Minimal Slack DM bot for publishing single-file HTML pages to a tailnet via Tail
 - Accepts Slack DMs only.
 - Supports natural-language generation requests, `generate <filename>.html <prompt>`, and `help`.
 - Accepts `.html` file uploads and saves them directly.
+- Accepts `.txt`, `.md`, `.csv`, and `.json` uploads as source material for generation.
 - Publishes files from a local `sites/` directory over Tailscale.
 - Replies with the tailnet URL for the saved page.
 
@@ -40,9 +41,11 @@ pip install -r requirements.txt
 
 - `connections:write`
 
-5. Install Tailscale on the host machine and sign in.
+5. In the Anthropic Console, enable web search for the API organization if it is not already enabled.
 
-6. Make sure the `tailscale` CLI works on the host machine. The app will run `tailscale serve --bg <sites_dir>` for you on startup. If you want to verify it manually first, use:
+6. Install Tailscale on the host machine and sign in.
+
+7. Make sure the `tailscale` CLI works on the host machine. The app will run `tailscale serve --bg <sites_dir>` for you on startup. If you want to verify it manually first, use:
 
 ```bash
 tailscale serve --bg /absolute/path/to/sites
@@ -51,6 +54,12 @@ tailscale serve --bg /absolute/path/to/sites
 ## Environment
 
 Copy `.env.example` to `.env` and fill in the values. `TAILSCALE_BASE_URL` is optional; if omitted, the app derives it from `tailscale status --json`.
+
+`ANTHROPIC_WEB_SEARCH=1` is enabled by default so Claude can look up current market data, companies, pricing, and other fresh facts. Web search uses Anthropic's paid search tool in addition to normal token usage. Set `ANTHROPIC_WEB_SEARCH=0` to disable it.
+
+The default model is `claude-sonnet-4-6`. For deeper reasoning at higher cost, set `ANTHROPIC_MODEL=claude-opus-4-6`.
+
+On Windows, if you already configured Tailscale Serve once from an administrator shell, set `SKIP_TAILSCALE_SERVE=1` so normal bot restarts do not need administrator permissions.
 
 ## Run
 
@@ -66,12 +75,18 @@ Send the bot a DM in one of these forms:
 
 ```text
 help
+what can you help me build?
+what are the current enterprise AI trends?
 generate market-map.html enterprise AI landscape with columns for category, company, funding, and stage
+generate market-map.html
 make me a market map for the enterprise AI landscape
+make me a marketplace map for enterprise AI
 create market-map.html for the enterprise AI landscape
 ```
 
-If a user uploads an `.html` file in a DM, the bot saves it and returns the tailnet URL.
+For natural-language requests, the bot picks a readable filename and asks Claude to infer a complete page structure with illustrative content. If you provide only a filename, the bot infers the page idea from the filename. You can also paste source notes, lists, or URLs directly into the message.
+
+If a user uploads an `.html` file in a DM, the bot saves it and returns the tailnet URL. If a user uploads `.txt`, `.md`, `.csv`, or `.json` files with a request, the bot uses those files as source material for the generated page.
 
 ## Notes
 

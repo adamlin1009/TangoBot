@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,34 @@ def _get_helper(module, *names):
         if callable(helper):
             return helper
     pytest.fail(f"None of these helpers exist on app: {', '.join(names)}")
+
+
+def _test_config(app):
+    return app.AppConfig(
+        slack_bot_token="xoxb-test",
+        slack_app_token="xapp-test",
+        anthropic_api_key="sk-ant-test",
+        anthropic_model="claude-sonnet-4-6",
+        sites_dir=app.Path("/tmp/sites"),
+        tailscale_bin="tailscale",
+        tailscale_base_url="https://example.ts.net",
+        web_search_enabled=True,
+        web_search_max_uses=3,
+    )
+
+
+class _FakeAnthropic:
+    def __init__(self, response_text):
+        self.messages = self
+        self.response_text = response_text
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        return SimpleNamespace(
+            content=[{"type": "text", "text": self.response_text}],
+            stop_reason="end_turn",
+        )
 
 
 def test_parse_help_command():
@@ -42,6 +71,21 @@ def test_parse_help_command():
     else:
         assert parsed[0] == "help"
         assert len(parsed) >= 1
+
+
+@pytest.mark.parametrize("message", ["guide", "usage", "instructions", "what can you do?"])
+def test_parse_help_aliases(message):
+    app = _load_app_module()
+    parse_command = _get_helper(
+        app,
+        "parse_command",
+        "parse_dm_command",
+        "parse_message",
+    )
+
+    parsed = parse_command(message)
+
+    assert parsed.kind == "help"
 
 
 def test_parse_generate_command():
@@ -69,7 +113,39 @@ def test_parse_generate_command():
         assert parsed[2] == "enterprise AI landscape"
 
 
-def test_parse_plain_language_generates_with_auto_filename():
+def test_parse_generate_without_prompt_infers_from_filename():
+    app = _load_app_module()
+    parse_command = _get_helper(
+        app,
+        "parse_command",
+        "parse_dm_command",
+        "parse_message",
+    )
+
+    parsed = parse_command("generate x.html")
+
+    assert parsed.kind == "generate"
+    assert parsed.filename == "x.html"
+    assert parsed.prompt == "Create a polished single-page web page for: x."
+
+
+def test_parse_natural_language_filename_only_infers_from_filename():
+    app = _load_app_module()
+    parse_command = _get_helper(
+        app,
+        "parse_command",
+        "parse_dm_command",
+        "parse_message",
+    )
+
+    parsed = parse_command("create market-map.html")
+
+    assert parsed.kind == "generate"
+    assert parsed.filename == "market-map.html"
+    assert parsed.prompt == "Create a polished single-page web page for: market map."
+
+
+def test_parse_plain_language_routes_for_claude_intent():
     app = _load_app_module()
     parse_command = _get_helper(
         app,
@@ -80,9 +156,45 @@ def test_parse_plain_language_generates_with_auto_filename():
 
     parsed = parse_command("make me a dashboard for enterprise AI startups")
 
-    assert parsed.kind == "generate"
-    assert parsed.filename == "make-me-a-dashboard-for-enterprise.html"
+    assert parsed.kind == "route"
+    assert parsed.filename is None
     assert parsed.prompt == "make me a dashboard for enterprise AI startups"
+
+
+def test_route_message_intent_can_generate_from_plain_language():
+    app = _load_app_module()
+    route_message_intent = _get_helper(app, "route_message_intent")
+    fake_anthropic = _FakeAnthropic(
+        '{"action":"generate","filename":null,"prompt":"make me a marketplace map for enterprise ai"}'
+    )
+
+    parsed = route_message_intent(
+        fake_anthropic,
+        _test_config(app),
+        "make me a marketplace map for enterprise ai",
+    )
+
+    assert parsed.kind == "generate"
+    assert parsed.filename == "marketplace-map-enterprise-ai.html"
+    assert parsed.prompt == "make me a marketplace map for enterprise ai"
+
+
+def test_route_message_intent_can_chat_from_plain_language():
+    app = _load_app_module()
+    route_message_intent = _get_helper(app, "route_message_intent")
+    fake_anthropic = _FakeAnthropic(
+        '{"action":"chat","filename":null,"prompt":"What can you help me with?"}'
+    )
+
+    parsed = route_message_intent(
+        fake_anthropic,
+        _test_config(app),
+        "What can you help me with?",
+    )
+
+    assert parsed.kind == "chat"
+    assert parsed.filename is None
+    assert parsed.prompt == "What can you help me with?"
 
 
 def test_parse_plain_language_uses_mentioned_html_filename():
@@ -98,7 +210,7 @@ def test_parse_plain_language_uses_mentioned_html_filename():
 
     assert parsed.kind == "generate"
     assert parsed.filename == "market-map.html"
-    assert parsed.prompt == "create for enterprise AI startups"
+    assert parsed.prompt == "enterprise AI startups"
 
 
 def test_prefix_and_slug_filename_helpers():
@@ -145,3 +257,108 @@ def test_file_share_dm_events_are_not_ignored():
     assert should_ignore({"channel_type": "im", "subtype": "file_share", "user": "U12345"}) is False
     assert should_ignore({"channel_type": "im", "subtype": "message_changed", "user": "U12345"}) is True
     assert should_ignore({"channel_type": "channel", "user": "U12345"}) is True
+
+
+def test_source_upload_file_types_are_supported():
+    app = _load_app_module()
+    is_supported_source_upload = _get_helper(app, "is_supported_source_upload")
+
+    assert is_supported_source_upload({"name": "companies.csv"}) is True
+    assert is_supported_source_upload({"name": "notes.md"}) is True
+    assert is_supported_source_upload({"name": "page.html"}) is False
+
+
+def test_source_only_upload_uses_source_filename():
+    app = _load_app_module()
+    filename_from_source_files = _get_helper(app, "filename_from_source_files")
+    prompt_from_source_filenames = _get_helper(app, "prompt_from_source_filenames")
+
+    files = [{"name": "companies.csv"}]
+
+    assert filename_from_source_files(files) == "companies.html"
+    assert prompt_from_source_filenames(files) == (
+        "Create a polished single-page web page from the attached source material: companies."
+    )
+
+
+def test_source_upload_with_text_forces_generation():
+    app = _load_app_module()
+    command_for_source_generation = _get_helper(app, "command_for_source_generation")
+
+    command = command_for_source_generation(
+        "make me a marketplace map for enterprise ai",
+        [{"name": "companies.csv"}],
+    )
+
+    assert command.kind == "generate"
+    assert command.filename == "marketplace-map-enterprise-ai.html"
+    assert command.prompt == "make me a marketplace map for enterprise ai"
+
+
+def test_build_prompt_with_source_material():
+    app = _load_app_module()
+    build_prompt_with_sources = _get_helper(app, "build_prompt_with_sources")
+
+    prompt = build_prompt_with_sources(
+        "make me a marketplace map for enterprise ai",
+        [{"name": "companies.csv", "content": "Company,Category\nOpenAI,Foundation models"}],
+    )
+
+    assert "User request:" in prompt
+    assert "make me a marketplace map for enterprise ai" in prompt
+    assert "--- Source file: companies.csv ---" in prompt
+    assert "OpenAI,Foundation models" in prompt
+
+
+def test_web_search_tools_can_be_enabled():
+    app = _load_app_module()
+    web_search_tools = _get_helper(app, "web_search_tools")
+    config = _test_config(app)
+
+    assert web_search_tools(config) == [
+        {
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 3,
+        }
+    ]
+
+
+def test_sources_section_is_appended_before_body_close():
+    app = _load_app_module()
+    append_sources_section = _get_helper(app, "append_sources_section")
+
+    html = append_sources_section(
+        "<html><body><h1>Market Map</h1></body></html>",
+        [{"url": "https://example.com?a=1&b=2", "title": "Example & Co"}],
+    )
+
+    assert "https://example.com?a=1&amp;b=2" in html
+    assert "Example &amp; Co" in html
+    assert html.index("<section") < html.index("</body>")
+
+
+def test_extracts_text_and_sources_from_dict_blocks():
+    app = _load_app_module()
+    extract_text_content = _get_helper(app, "extract_text_content")
+    extract_cited_sources = _get_helper(app, "extract_cited_sources")
+
+    blocks = [
+        {
+            "type": "text",
+            "text": "<html>",
+            "citations": [
+                {
+                    "type": "web_search_result_location",
+                    "url": "https://example.com/source",
+                    "title": "Example Source",
+                }
+            ],
+        },
+        {"type": "text", "text": "</html>"},
+    ]
+
+    assert extract_text_content(blocks) == "<html>\n</html>"
+    assert extract_cited_sources(blocks) == [
+        {"url": "https://example.com/source", "title": "Example Source"}
+    ]
