@@ -136,3 +136,12 @@ def test_prompt_to_filename_slugging_helper():
     assert "enterprise-ai-landscape" in filename
     assert "/" not in filename
     assert "\\" not in filename
+
+
+def test_file_share_dm_events_are_not_ignored():
+    app = _load_app_module()
+    should_ignore = _get_helper(app, "should_ignore_message_event")
+
+    assert should_ignore({"channel_type": "im", "subtype": "file_share", "user": "U12345"}) is False
+    assert should_ignore({"channel_type": "im", "subtype": "message_changed", "user": "U12345"}) is True
+    assert should_ignore({"channel_type": "channel", "user": "U12345"}) is True

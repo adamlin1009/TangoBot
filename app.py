@@ -241,6 +241,14 @@ def is_supported_upload(file_obj: dict[str, Any]) -> bool:
     return Path(file_obj.get("name", "")).suffix.lower() == ".html"
 
 
+def should_ignore_message_event(event: dict[str, Any]) -> bool:
+    if event.get("channel_type") != "im":
+        return True
+    if event.get("bot_id"):
+        return True
+    return bool(event.get("subtype") and event.get("subtype") != "file_share")
+
+
 def create_slack_app(config: AppConfig) -> Any:
     from anthropic import Anthropic
     from slack_bolt import App
@@ -250,9 +258,7 @@ def create_slack_app(config: AppConfig) -> Any:
 
     @app.event("message")
     def handle_message_events(event: dict[str, Any], say: Any, client: Any, logger: Any) -> None:
-        if event.get("channel_type") != "im":
-            return
-        if event.get("bot_id") or event.get("subtype"):
+        if should_ignore_message_event(event):
             return
 
         slack_user_id = event.get("user")
