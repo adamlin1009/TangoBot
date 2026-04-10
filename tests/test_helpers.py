@@ -69,6 +69,38 @@ def test_parse_generate_command():
         assert parsed[2] == "enterprise AI landscape"
 
 
+def test_parse_plain_language_generates_with_auto_filename():
+    app = _load_app_module()
+    parse_command = _get_helper(
+        app,
+        "parse_command",
+        "parse_dm_command",
+        "parse_message",
+    )
+
+    parsed = parse_command("make me a dashboard for enterprise AI startups")
+
+    assert parsed.kind == "generate"
+    assert parsed.filename == "make-me-a-dashboard-for-enterprise.html"
+    assert parsed.prompt == "make me a dashboard for enterprise AI startups"
+
+
+def test_parse_plain_language_uses_mentioned_html_filename():
+    app = _load_app_module()
+    parse_command = _get_helper(
+        app,
+        "parse_command",
+        "parse_dm_command",
+        "parse_message",
+    )
+
+    parsed = parse_command("create market-map.html for enterprise AI startups")
+
+    assert parsed.kind == "generate"
+    assert parsed.filename == "market-map.html"
+    assert parsed.prompt == "create for enterprise AI startups"
+
+
 def test_prefix_and_slug_filename_helpers():
     app = _load_app_module()
     build_filename = _get_helper(

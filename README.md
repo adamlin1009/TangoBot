@@ -5,7 +5,7 @@ Minimal Slack DM bot for publishing single-file HTML pages to a tailnet via Tail
 ## What v1 does
 
 - Accepts Slack DMs only.
-- Supports `generate <filename>.html <prompt>` and `help`.
+- Supports natural-language generation requests, `generate <filename>.html <prompt>`, and `help`.
 - Accepts `.html` file uploads and saves them directly.
 - Publishes files from a local `sites/` directory over Tailscale.
 - Replies with the tailnet URL for the saved page.
@@ -67,6 +67,8 @@ Send the bot a DM in one of these forms:
 ```text
 help
 generate market-map.html enterprise AI landscape with columns for category, company, funding, and stage
+make me a market map for the enterprise AI landscape
+create market-map.html for the enterprise AI landscape
 ```
 
 If a user uploads an `.html` file in a DM, the bot saves it and returns the tailnet URL.

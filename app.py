@@ -13,6 +13,7 @@ HELP_TEXT = (
     "Usage:\n"
     "- Upload one `.html` file in this DM to publish it.\n"
     "- `generate <filename>.html <prompt>` to create a page.\n"
+    "- Or just describe the page you want, and I will choose a filename.\n"
     "- `help` to show this message."
 )
 
@@ -88,6 +89,16 @@ def filename_from_prompt(prompt: str) -> str:
     return f"{'-'.join(words[:6]).strip('-') or 'page'}.html"
 
 
+def extract_requested_filename(text: str) -> tuple[str | None, str]:
+    match = re.search(r"([A-Za-z0-9][A-Za-z0-9_.-]*\.html)\b", text)
+    if not match:
+        return None, text.strip()
+
+    filename = normalize_html_filename(match.group(1))
+    prompt = re.sub(r"\s+", " ", f"{text[:match.start()]} {text[match.end():]}").strip()
+    return filename, prompt or text.strip()
+
+
 def parse_command(text: str | None) -> Command | None:
     if not text or not text.strip():
         return None
@@ -104,7 +115,12 @@ def parse_command(text: str | None) -> Command | None:
             prompt=match.group(2).strip(),
         )
 
-    return Command(kind="unknown")
+    filename, prompt = extract_requested_filename(stripped)
+    return Command(
+        kind="generate",
+        filename=filename or filename_from_prompt(prompt),
+        prompt=prompt,
+    )
 
 
 def extract_text_content(blocks: list[Any]) -> str:
@@ -272,10 +288,6 @@ def create_slack_app(config: AppConfig) -> Any:
         if command.kind == "help":
             say(HELP_TEXT)
             return
-        if command.kind == "unknown":
-            say("Unknown command. Send `help` for usage.")
-            return
-
         assert command.filename is not None
         assert command.prompt is not None
 
