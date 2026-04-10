@@ -7,6 +7,7 @@ Minimal Slack DM bot for publishing single-file HTML pages to a tailnet via Tail
 - Accepts Slack DMs only.
 - Supports natural-language generation requests, `generate <filename>.html <prompt>`, and `help`.
 - Accepts `.html` file uploads and saves them directly.
+- Accepts `.jsx` React component uploads and publishes both the source and a runnable `.html` page.
 - Accepts `.txt`, `.md`, `.csv`, and `.json` uploads as source material for generation.
 - Publishes files from a local `sites/` directory over Tailscale.
 - Replies with the tailnet URL for the saved page.
@@ -14,7 +15,8 @@ Minimal Slack DM bot for publishing single-file HTML pages to a tailnet via Tail
 ## What v1 does not do
 
 - No `revise` flow.
-- No `.jsx` support.
+- No generated JSX; Claude-generated pages are still published as HTML.
+- No JSX imports, npm packages, local assets, CSS imports, or multi-file React apps.
 - No database, version history, or deployment pipeline.
 
 ## Setup
@@ -86,7 +88,7 @@ create market-map.html for the enterprise AI landscape
 
 For natural-language requests, the bot picks a readable filename and asks Claude to infer a complete page structure with illustrative content. If you provide only a filename, the bot infers the page idea from the filename. You can also paste source notes, lists, or URLs directly into the message.
 
-If a user uploads an `.html` file in a DM, the bot saves it and returns the tailnet URL. If a user uploads `.txt`, `.md`, `.csv`, or `.json` files with a request, the bot uses those files as source material for the generated page.
+If a user uploads an `.html` file in a DM, the bot saves it and returns the tailnet URL. If a user uploads a `.jsx` file, it must be one self-contained React component using global `React`; the bot saves the `.jsx` source and publishes a wrapped `.html` page that loads React, ReactDOM, and Babel from CDNs. If a user uploads `.txt`, `.md`, `.csv`, or `.json` files with a request, the bot uses those files as source material for the generated page.
 
 ## Notes
 

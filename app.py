@@ -26,8 +26,9 @@ HELP_TEXT = (
     "*Use your own source material*\n"
     "Paste notes, company lists, links, or data directly into the DM. "
     "You can also attach `.txt`, `.md`, `.csv`, or `.json` files with a request, and I will use those files as the primary source material.\n\n"
-    "*Publish an existing HTML file*\n"
-    "Upload a single `.html` file in this DM and I will publish it directly.\n\n"
+    "*Publish an existing HTML or JSX file*\n"
+    "Upload a single `.html` file in this DM and I will publish it directly. "
+    "Upload a single self-contained `.jsx` React component with no imports and I will publish both the source and a runnable HTML page.\n\n"
     "*Filenames and access*\n"
     "Generated pages get readable filenames automatically. Uploaded or requested filenames are prefixed with your Slack user ID to avoid collisions. "
     "Anyone on the company tailnet can view the returned link.\n\n"
@@ -72,6 +73,7 @@ ROUTER_SYSTEM_PROMPT = (
 )
 
 SOURCE_FILE_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json"}
+ARTIFACT_FILE_SUFFIXES = {".html", ".jsx"}
 MAX_SOURCE_FILE_CHARS = 20000
 MAX_TOTAL_SOURCE_CHARS = 60000
 MAX_SLACK_MESSAGE_CHARS = 3500
@@ -159,12 +161,26 @@ def normalize_html_filename(name: str) -> str:
     return f"{slugify(stem)}.html"
 
 
+def normalize_jsx_filename(name: str) -> str:
+    base_name = Path(name).name
+    stem = Path(base_name).stem
+    return f"{slugify(stem)}.jsx"
+
+
 def build_site_filename(slack_user_id: str, requested_name: str) -> str:
     normalized = normalize_html_filename(requested_name)
     return f"{slack_user_id}-{normalized}"
 
 
 build_storage_filename = build_site_filename
+
+
+def build_jsx_source_filename(slack_user_id: str, requested_name: str) -> str:
+    return f"{slack_user_id}-{normalize_jsx_filename(requested_name)}"
+
+
+def build_jsx_page_filename(slack_user_id: str, requested_name: str) -> str:
+    return f"{slack_user_id}-{normalize_html_filename(requested_name)}"
 
 
 FILENAME_STOPWORDS = {
@@ -312,6 +328,118 @@ def command_from_route_payload(payload: dict[str, Any], original_text: str) -> C
         return Command(kind="chat", prompt=prompt)
 
     return fallback_route_message_intent(original_text)
+
+
+def detect_jsx_component_name(jsx_source: str) -> str | None:
+    patterns = [
+        r"\bfunction\s+(App)\s*\(",
+        r"\bconst\s+(App)\s*=",
+        r"\bclass\s+(App)\s+extends\b",
+        r"\bexport\s+default\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\(",
+        r"\bexport\s+default\s+class\s+([A-Z][A-Za-z0-9_]*)\s+extends\b",
+        r"\bexport\s+default\s+([A-Z][A-Za-z0-9_]*)\s*;?",
+        r"\bfunction\s+([A-Z][A-Za-z0-9_]*)\s*\(",
+        r"\bconst\s+([A-Z][A-Za-z0-9_]*)\s*=",
+        r"\bclass\s+([A-Z][A-Za-z0-9_]*)\s+extends\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, jsx_source)
+        if match:
+            return match.group(1)
+    return None
+
+
+def normalize_jsx_exports(jsx_source: str) -> str:
+    normalized = re.sub(
+        r"\bexport\s+default\s+function\s+([A-Z][A-Za-z0-9_]*)\s*\(",
+        r"function \1(",
+        jsx_source,
+    )
+    normalized = re.sub(
+        r"\bexport\s+default\s+class\s+([A-Z][A-Za-z0-9_]*)\s+extends\b",
+        r"class \1 extends",
+        normalized,
+    )
+    normalized = re.sub(r"\bexport\s+default\s+[A-Z][A-Za-z0-9_]*\s*;?", "", normalized)
+    return normalized
+
+
+def validate_jsx_source(jsx_source: str) -> str:
+    if re.search(r"^\s*import\s+", jsx_source, re.MULTILINE):
+        raise ValueError("JSX uploads must be one self-contained component; `import` is not supported.")
+    if re.search(r"\brequire\s*\(", jsx_source):
+        raise ValueError("JSX uploads must be one self-contained component; `require(...)` is not supported.")
+    if re.search(r"^\s*export\s+(?!default\b)", jsx_source, re.MULTILINE):
+        raise ValueError("Only `export default` is supported in JSX uploads.")
+
+    component_name = detect_jsx_component_name(jsx_source)
+    if not component_name:
+        raise ValueError(
+            "Could not find a React component. Use `function App()`, `const App = ...`, "
+            "`export default function App()`, or another PascalCase component."
+        )
+    return component_name
+
+
+def jsx_runtime_error_script() -> str:
+    return """
+window.addEventListener("error", function(event) {
+  var root = document.getElementById("root");
+  if (!root) return;
+  root.innerHTML = "<main class=\\"tangobot-error\\"><h1>JSX runtime error</h1><pre></pre></main>";
+  root.querySelector("pre").textContent = event.message || String(event.error || "Unknown error");
+});
+""".strip()
+
+
+def wrap_jsx_as_html(jsx_source: str, title: str) -> str:
+    component_name = validate_jsx_source(jsx_source)
+    normalized_source = normalize_jsx_exports(jsx_source).replace("</script", "<\\/script")
+    escaped_title = html_escape.escape(title)
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escaped_title}</title>
+  <style>
+    html, body, #root {{
+      min-height: 100%;
+      margin: 0;
+    }}
+    body {{
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    .tangobot-error {{
+      max-width: 900px;
+      margin: 48px auto;
+      padding: 24px;
+      border: 1px solid #f0b4b4;
+      border-radius: 8px;
+      background: #fff5f5;
+      color: #5f1515;
+    }}
+    .tangobot-error pre {{
+      white-space: pre-wrap;
+    }}
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script>{jsx_runtime_error_script()}</script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="env,react">
+{normalized_source}
+
+const tangobotRoot = ReactDOM.createRoot(document.getElementById("root"));
+tangobotRoot.render(<{component_name} />);
+  </script>
+</body>
+</html>
+"""
 
 
 def extract_text_content(blocks: list[Any]) -> str:
@@ -633,8 +761,16 @@ def download_slack_file(client: Any, bot_token: str, file_obj: dict[str, Any]) -
         return response.read().decode("utf-8", errors="replace")
 
 
-def is_supported_upload(file_obj: dict[str, Any]) -> bool:
+def is_supported_html_upload(file_obj: dict[str, Any]) -> bool:
     return Path(file_obj.get("name", "")).suffix.lower() == ".html"
+
+
+def is_supported_jsx_upload(file_obj: dict[str, Any]) -> bool:
+    return Path(file_obj.get("name", "")).suffix.lower() == ".jsx"
+
+
+def is_supported_upload(file_obj: dict[str, Any]) -> bool:
+    return Path(file_obj.get("name", "")).suffix.lower() in ARTIFACT_FILE_SUFFIXES
 
 
 def is_supported_source_upload(file_obj: dict[str, Any]) -> bool:
@@ -668,7 +804,8 @@ def create_slack_app(config: AppConfig) -> Any:
 
         files = event.get("files") or []
         if files:
-            html_files = [file_obj for file_obj in files if is_supported_upload(file_obj)]
+            html_files = [file_obj for file_obj in files if is_supported_html_upload(file_obj)]
+            jsx_files = [file_obj for file_obj in files if is_supported_jsx_upload(file_obj)]
             source_files = [file_obj for file_obj in files if is_supported_source_upload(file_obj)]
 
             for file_obj in html_files:
@@ -685,7 +822,30 @@ def create_slack_app(config: AppConfig) -> Any:
 
                 say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")
 
-            if html_files:
+            for file_obj in jsx_files:
+                original_name = file_obj.get("name", "upload.jsx")
+                source_name = build_jsx_source_filename(slack_user_id, original_name)
+                page_name = build_jsx_page_filename(slack_user_id, original_name)
+                source_path = config.sites_dir / source_name
+                page_path = config.sites_dir / page_name
+
+                try:
+                    jsx_source = download_slack_file(client, config.slack_bot_token, file_obj)
+                    page_title = re.sub(r"[^A-Za-z0-9]+", " ", Path(original_name).stem).strip() or "React Page"
+                    html = wrap_jsx_as_html(jsx_source, page_title)
+                    write_text_file(source_path, jsx_source)
+                    write_text_file(page_path, html)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Failed to publish JSX file %s", original_name)
+                    say(f"Failed to publish `{original_name}`: {exc}")
+                    continue
+
+                say(
+                    f"Published `{page_name}`: {publish_url(config, page_name)}\n"
+                    f"Source JSX: {publish_url(config, source_name)}"
+                )
+
+            if html_files or jsx_files:
                 return
 
             if source_files:
@@ -725,7 +885,10 @@ def create_slack_app(config: AppConfig) -> Any:
                 say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")
                 return
 
-            say("Supported uploads are `.html` for publishing or `.txt`, `.md`, `.csv`, `.json` as generation sources.")
+            say(
+                "Supported uploads are `.html` or `.jsx` for publishing, "
+                "or `.txt`, `.md`, `.csv`, `.json` as generation sources."
+            )
             return
 
         command = parse_command(event.get("text"))

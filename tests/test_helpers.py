@@ -231,6 +231,15 @@ def test_prefix_and_slug_filename_helpers():
     assert "market-map" in prefixed
 
 
+def test_jsx_filename_helpers_preserve_source_and_page_names():
+    app = _load_app_module()
+    build_jsx_source_filename = _get_helper(app, "build_jsx_source_filename")
+    build_jsx_page_filename = _get_helper(app, "build_jsx_page_filename")
+
+    assert build_jsx_source_filename("U12345", "Market Map.jsx") == "U12345-market-map.jsx"
+    assert build_jsx_page_filename("U12345", "Market Map.jsx") == "U12345-market-map.html"
+
+
 def test_prompt_to_filename_slugging_helper():
     app = _load_app_module()
     build_filename = _get_helper(
@@ -261,11 +270,58 @@ def test_file_share_dm_events_are_not_ignored():
 
 def test_source_upload_file_types_are_supported():
     app = _load_app_module()
+    is_supported_upload = _get_helper(app, "is_supported_upload")
     is_supported_source_upload = _get_helper(app, "is_supported_source_upload")
 
+    assert is_supported_upload({"name": "page.html"}) is True
+    assert is_supported_upload({"name": "component.jsx"}) is True
+    assert is_supported_upload({"name": "companies.csv"}) is False
     assert is_supported_source_upload({"name": "companies.csv"}) is True
     assert is_supported_source_upload({"name": "notes.md"}) is True
     assert is_supported_source_upload({"name": "page.html"}) is False
+    assert is_supported_source_upload({"name": "component.jsx"}) is False
+
+
+@pytest.mark.parametrize(
+    ("jsx_source", "component_name"),
+    [
+        ("function App() { return <main>Hello</main>; }", "App"),
+        ("const App = () => <main>Hello</main>;", "App"),
+        ("const App = () => <main>Hello</main>; export default App;", "App"),
+        ("export default function App() { return <main>Hello</main>; }", "App"),
+        ("function MarketMap() { return <main>Hello</main>; }\nexport default MarketMap;", "MarketMap"),
+    ],
+)
+def test_jsx_component_detection_supports_common_patterns(jsx_source, component_name):
+    app = _load_app_module()
+    validate_jsx_source = _get_helper(app, "validate_jsx_source")
+    wrap_jsx_as_html = _get_helper(app, "wrap_jsx_as_html")
+
+    assert validate_jsx_source(jsx_source) == component_name
+    html = wrap_jsx_as_html(jsx_source, "Market Map")
+
+    assert "https://unpkg.com/react@18/umd/react.production.min.js" in html
+    assert "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" in html
+    assert "https://unpkg.com/@babel/standalone/babel.min.js" in html
+    assert '<div id="root"></div>' in html
+    assert f"tangobotRoot.render(<{component_name} />);" in html
+    assert "export default" not in html
+
+
+def test_jsx_upload_rejects_imports():
+    app = _load_app_module()
+    validate_jsx_source = _get_helper(app, "validate_jsx_source")
+
+    with pytest.raises(ValueError, match="import"):
+        validate_jsx_source('import React from "react";\nfunction App() { return <main />; }')
+
+
+def test_jsx_upload_requires_component():
+    app = _load_app_module()
+    validate_jsx_source = _get_helper(app, "validate_jsx_source")
+
+    with pytest.raises(ValueError, match="Could not find a React component"):
+        validate_jsx_source("const message = 'hello';")
 
 
 def test_source_only_upload_uses_source_filename():
