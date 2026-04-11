@@ -13,14 +13,15 @@ from typing import Any
 
 HELP_TEXT = (
     "*TangoBot usage guide*\n\n"
+    "*Beta testing note*\n"
+    "TangoBot is in beta testing. Expect rough edges, and review generated pages before sharing them broadly.\n\n"
     "*Chat with Claude*\n"
-    "Ask normal questions, brainstorm, summarize, compare options, or research current topics. "
-    "If current facts matter, I can use Anthropic web search when it is enabled.\n\n"
+    "Ask normal questions, brainstorm, summarize, compare options, or work from source material you paste or upload.\n\n"
     "*Generate and host a page*\n"
     "Describe the page you want and I will create a self-contained HTML page, save it, and reply with a Tailscale URL.\n"
     "If the request is too thin, I will ask one clarification question first.\n"
     "Examples:\n"
-    "- `make me a marketplace map for enterprise AI`\n"
+    "- `make me a marketplace map for enterprise AI with categories and vendor examples`\n"
     "- `build a pricing dashboard for our Q2 packaging options`\n"
     "- `create market-map.html for enterprise AI startups`\n"
     "- `generate market-map.html enterprise AI landscape with categories, companies, and funding`\n"
@@ -45,22 +46,38 @@ GENERATION_SYSTEM_PROMPT = (
     "The first bytes of your response must be <!doctype html>. "
     "Return only raw HTML; never include progress narration, research narration, explanations, or Markdown fences. "
     "If the request is brief but specific enough, infer a useful structure and include realistic illustrative content. "
-    "When current facts, companies, funding, market landscapes, pricing, news, or dates matter, use web search. "
     "Treat user-provided notes, pasted lists, uploaded files, and URLs as primary source material. "
-    "Use web search to fill gaps, verify current facts, and add citations when helpful. "
-    "Prefer current, specific, verifiable information over generic filler. "
     "Do not ask follow-up questions. "
     "Avoid empty placeholders such as TODO, lorem ipsum, or coming soon. "
-    "When using web information, include a concise Sources section with clickable links. "
     "Make the page responsive and immediately useful. "
     "Inline all CSS and JavaScript."
 )
 
+GENERATION_NO_SEARCH_SYSTEM_PROMPT = (
+    "Use only the user's request, provided source material, and general model knowledge. "
+    "Do not claim to have browsed the web, checked live sources, or verified current facts. "
+    "If fresh market data is not supplied, keep specific company, funding, pricing, and date-sensitive claims clearly illustrative."
+)
+
+GENERATION_WEB_SEARCH_SYSTEM_PROMPT = (
+    "Web search is available. When current facts, companies, funding, market landscapes, pricing, news, or dates matter, "
+    "use web search to fill gaps, verify current facts, and add citations when helpful. "
+    "When using web information, include a concise Sources section with clickable links."
+)
+
 CHAT_SYSTEM_PROMPT = (
     "You are Claude inside a Slack DM. Be concise, useful, and direct. "
-    "Use web search when current facts, companies, pricing, news, or dates matter. "
     "If the user appears to want a hosted web page, dashboard, market map, report page, demo, or HTML artifact, "
     "tell them you can generate it and ask them to phrase it as a page request if needed."
+)
+
+CHAT_NO_SEARCH_SYSTEM_PROMPT = (
+    "Use only the conversation and provided source material. "
+    "Do not claim to have browsed the web or checked live sources."
+)
+
+CHAT_WEB_SEARCH_SYSTEM_PROMPT = (
+    "Web search is available. Use it when current facts, companies, pricing, news, or dates matter."
 )
 
 ROUTER_SYSTEM_PROMPT = (
@@ -78,9 +95,14 @@ ROUTER_SYSTEM_PROMPT = (
 SOURCE_FILE_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json"}
 ARTIFACT_FILE_SUFFIXES = {".html", ".jsx"}
 DEFAULT_STATE_FILE = Path.home() / ".tangobot" / "pending_clarifications.json"
-MAX_SOURCE_FILE_CHARS = 20000
-MAX_TOTAL_SOURCE_CHARS = 60000
+MAX_ROUTER_INPUT_CHARS = 3000
+MAX_MODEL_INPUT_CHARS = 12000
+MAX_SOURCE_FILE_CHARS = 12000
+MAX_TOTAL_SOURCE_CHARS = 20000
 MAX_SLACK_MESSAGE_CHARS = 3500
+ROUTER_MAX_TOKENS = 400
+CHAT_MAX_TOKENS = 1200
+GENERATION_MAX_TOKENS = 4096
 HELP_ALIASES = {
     "help",
     "guide",
@@ -117,6 +139,7 @@ GENERATION_ARTIFACT_TERMS = {
     "visualization",
     "website",
     "ecosystem",
+    "marketplace",
 }
 GENERATION_FILLER_TERMS = {
     "all",
@@ -259,6 +282,39 @@ FILENAME_STOPWORDS = {
     "with",
 }
 GENERATION_STOPWORDS = FILENAME_STOPWORDS | GENERATION_ARTIFACT_TERMS | GENERATION_FILLER_TERMS
+BROAD_MARKET_MAP_TERMS = {
+    "agent",
+    "agents",
+    "ai",
+    "companies",
+    "company",
+    "enterprise",
+    "enterprises",
+    "marketplaces",
+    "platform",
+    "platforms",
+    "products",
+    "solutions",
+    "software",
+    "startup",
+    "startups",
+    "tool",
+    "tools",
+    "vendor",
+    "vendors",
+}
+BROAD_MARKET_MAP_DETAIL_PATTERN = re.compile(
+    r"\b("
+    r"attached|based on|buyer|buyers|categories|category|columns|compare|comparison|csv|"
+    r"funding|geography|include|including|investor|investors|json|pricing|rank|ranking|"
+    r"region|rows|score|segment|segmented|stage|vertical|with"
+    r")\b",
+    re.IGNORECASE,
+)
+BROAD_MARKET_MAP_PATTERN = re.compile(
+    r"\b(market\s+map|marketplace\s+map|landscape|matrix|ecosystem)\b",
+    re.IGNORECASE,
+)
 
 
 def filename_from_prompt(prompt: str) -> str:
@@ -290,6 +346,24 @@ def generation_content_terms(text: str) -> list[str]:
     ]
 
 
+def is_broad_market_map_request(text: str) -> bool:
+    if not BROAD_MARKET_MAP_PATTERN.search(text):
+        return False
+    if BROAD_MARKET_MAP_DETAIL_PATTERN.search(text):
+        return False
+
+    content_terms = generation_content_terms(text)
+    if not content_terms:
+        return True
+
+    specific_terms = [
+        word
+        for word in content_terms
+        if word not in BROAD_MARKET_MAP_TERMS
+    ]
+    return len(content_terms) <= 3 and not specific_terms
+
+
 def should_clarify_generation_request(filename: str | None, prompt: str | None) -> bool:
     prompt_text = (prompt or "").strip()
     if not prompt_text:
@@ -300,12 +374,18 @@ def should_clarify_generation_request(filename: str | None, prompt: str | None) 
     words = re.findall(r"[a-z0-9]+", prompt_text.lower())
     if not words:
         return True
-    return not generation_content_terms(prompt_text)
+    if not generation_content_terms(prompt_text):
+        return True
+    return is_broad_market_map_request(prompt_text)
 
 
 def clarification_question_for(filename: str | None, prompt: str | None) -> str:
     combined = f"{title_from_filename(filename)} {prompt or ''}".lower()
     if re.search(r"\b(map|landscape|matrix)\b", combined):
+        if filename and (prompt or "").strip() == prompt_from_filename(filename):
+            return "What market, industry, or audience should this map cover?"
+        if generation_content_terms(prompt or ""):
+            return "What audience, categories, or source material should this map use?"
         return "What market, industry, or audience should this map cover?"
     if re.search(r"\bdashboard\b", combined):
         return "What data, team, or business area should this dashboard cover?"
@@ -341,16 +421,17 @@ def generation_or_clarification_command(
 def build_generation_prompt(prompt: str, filename: str | None = None) -> str:
     title = title_from_filename(filename)
     filename_line = f"Requested filename: {filename}\n" if filename else ""
+    bounded_prompt = truncate_text(prompt, MAX_MODEL_INPUT_CHARS)
     return (
         f"{filename_line}"
-        f"User request:\n{prompt}\n\n"
+        f"User request:\n{bounded_prompt}\n\n"
         "Build the actual requested artifact as a finished single-page HTML document. "
         "Infer the artifact type, audience, core content, layout, and useful interactions from the request. "
         "Use the requested filename as intent context, but do not show the filename as a title unless it is natural.\n\n"
         "If the request is brief, choose practical defaults and make the page immediately useful instead of generic. "
         "Maps should become structured visual landscapes; dashboards should become data-oriented views; "
         "tools should be usable on the first screen; reports and plans should be scannable, specific, and organized. "
-        "If current facts, companies, markets, pricing, news, dates, or funding matter, use web search and cite sources.\n\n"
+        "Use source material supplied by the user for factual details and avoid unsupported claims about current facts.\n\n"
         f"Working title or inferred topic: {title}."
     )
 
@@ -725,8 +806,9 @@ def truncate_text(value: str, max_chars: int) -> str:
 
 
 def build_prompt_with_sources(prompt: str, source_files: list[dict[str, str]]) -> str:
+    bounded_prompt = truncate_text(prompt, MAX_MODEL_INPUT_CHARS)
     if not source_files:
-        return prompt
+        return bounded_prompt
 
     rendered_sources = []
     total_chars = 0
@@ -742,9 +824,9 @@ def build_prompt_with_sources(prompt: str, source_files: list[dict[str, str]]) -
         )
 
     return (
-        f"User request:\n{prompt}\n\n"
+        f"User request:\n{bounded_prompt}\n\n"
         "Use the following user-provided source material as the primary factual basis for the page. "
-        "You may use web search to verify or supplement it, but do not ignore these sources.\n\n"
+        "Do not ignore these sources or replace them with generic filler.\n\n"
         + "\n\n".join(rendered_sources)
     )
 
@@ -858,8 +940,8 @@ def load_config() -> AppConfig:
         sites_dir=sites_dir,
         tailscale_bin=tailscale_bin,
         tailscale_base_url=tailscale_base_url.rstrip("/"),
-        web_search_enabled=env_bool("ANTHROPIC_WEB_SEARCH", True),
-        web_search_max_uses=max(env_int("ANTHROPIC_WEB_SEARCH_MAX_USES", 5), 1),
+        web_search_enabled=env_bool("ANTHROPIC_WEB_SEARCH", False),
+        web_search_max_uses=max(env_int("ANTHROPIC_WEB_SEARCH_MAX_USES", 2), 1),
         state_file=state_file,
     )
 
@@ -887,6 +969,50 @@ def web_search_tools(config: AppConfig) -> list[dict[str, Any]]:
     ]
 
 
+def generation_system_prompt(config: AppConfig) -> str:
+    search_guidance = (
+        GENERATION_WEB_SEARCH_SYSTEM_PROMPT
+        if config.web_search_enabled
+        else GENERATION_NO_SEARCH_SYSTEM_PROMPT
+    )
+    return f"{GENERATION_SYSTEM_PROMPT} {search_guidance}"
+
+
+def chat_system_prompt(config: AppConfig) -> str:
+    search_guidance = (
+        CHAT_WEB_SEARCH_SYSTEM_PROMPT
+        if config.web_search_enabled
+        else CHAT_NO_SEARCH_SYSTEM_PROMPT
+    )
+    return f"{CHAT_SYSTEM_PROMPT} {search_guidance}"
+
+
+RATE_LIMIT_ERROR_PATTERN = re.compile(
+    r"\b(429|rate[_ -]?limit|input tokens per minute|tokens per minute|requests per minute)\b",
+    re.IGNORECASE,
+)
+
+
+def is_rate_limit_error(exc: BaseException) -> bool:
+    error_text = f"{exc.__class__.__name__}: {exc}"
+    return bool(RATE_LIMIT_ERROR_PATTERN.search(error_text))
+
+
+def generation_failure_message(stored_name: str, exc: BaseException) -> str:
+    if is_rate_limit_error(exc):
+        return (
+            f"Generation hit the model rate limit for `{stored_name}`. "
+            "Wait about a minute and try again with a narrower scope, or attach source data so I can avoid a broad research-style prompt."
+        )
+    return f"Generation failed for `{stored_name}`: {exc}"
+
+
+def chat_failure_message(exc: BaseException) -> str:
+    if is_rate_limit_error(exc):
+        return "Chat hit the model rate limit. Wait about a minute and try again with a shorter message."
+    return f"Chat failed: {exc}"
+
+
 def create_anthropic_message(anthropic: Any, request: dict[str, Any]) -> Any:
     response = anthropic.messages.create(**request)
     continuation_count = 0
@@ -905,19 +1031,20 @@ def route_message_intent(anthropic: Any, config: AppConfig, text: str) -> Comman
     if hinted_command:
         return hinted_command
 
+    router_text = truncate_text(text, MAX_ROUTER_INPUT_CHARS)
     request = {
         "model": config.anthropic_model,
-        "max_tokens": 600,
+        "max_tokens": ROUTER_MAX_TOKENS,
         "system": ROUTER_SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": text}],
+        "messages": [{"role": "user", "content": router_text}],
     }
 
     try:
         response = create_anthropic_message(anthropic, request)
         payload = extract_json_object(extract_text_content(response.content))
-        return command_from_route_payload(payload, text)
+        return command_from_route_payload(payload, router_text)
     except Exception:  # noqa: BLE001
-        return fallback_route_message_intent(text)
+        return fallback_route_message_intent(router_text)
 
 
 def append_sources_to_slack_response(text: str, sources: list[dict[str, str]]) -> str:
@@ -940,9 +1067,9 @@ def truncate_slack_response(text: str) -> str:
 def chat_with_claude(anthropic: Any, config: AppConfig, prompt: str) -> str:
     request: dict[str, Any] = {
         "model": config.anthropic_model,
-        "max_tokens": 1600,
-        "system": CHAT_SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": CHAT_MAX_TOKENS,
+        "system": chat_system_prompt(config),
+        "messages": [{"role": "user", "content": truncate_text(prompt, MAX_MODEL_INPUT_CHARS)}],
     }
     tools = web_search_tools(config)
     if tools:
@@ -967,11 +1094,12 @@ HTML_REPAIR_PROMPT = (
 
 
 def generate_html(anthropic: Any, config: AppConfig, prompt: str, filename: str | None = None) -> str:
-    messages: list[dict[str, Any]] = [{"role": "user", "content": build_generation_prompt(prompt, filename)}]
+    generation_prompt = build_generation_prompt(prompt, filename)
+    messages: list[dict[str, Any]] = [{"role": "user", "content": generation_prompt}]
     request: dict[str, Any] = {
         "model": config.anthropic_model,
-        "max_tokens": 8192,
-        "system": GENERATION_SYSTEM_PROMPT,
+        "max_tokens": GENERATION_MAX_TOKENS,
+        "system": generation_system_prompt(config),
         "messages": messages,
     }
     tools = web_search_tools(config)
@@ -988,13 +1116,12 @@ def generate_html(anthropic: Any, config: AppConfig, prompt: str, filename: str 
         html = extract_html_document(extract_text_content(response.content))
         return append_sources_section(html, first_sources)
     except ValueError as first_error:
-        request["messages"].append({"role": "assistant", "content": response.content})
-        request["messages"].append(
+        request["messages"] = [
             {
                 "role": "user",
-                "content": f"{HTML_REPAIR_PROMPT}\n\nValidation error: {first_error}",
+                "content": f"{generation_prompt}\n\n{HTML_REPAIR_PROMPT}\n\nValidation error: {first_error}",
             }
-        )
+        ]
 
     retry_response = create_anthropic_message(anthropic, request)
     retry_search_errors = extract_web_search_errors(retry_response.content)
@@ -1160,7 +1287,7 @@ def create_slack_app(config: AppConfig) -> Any:
                     write_text_file(output_path, html)
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Failed to generate %s from source attachments", stored_name)
-                    say(f"Generation failed for `{stored_name}`: {exc}")
+                    say(generation_failure_message(stored_name, exc))
                     return
 
                 say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")
@@ -1197,7 +1324,7 @@ def create_slack_app(config: AppConfig) -> Any:
                 write_text_file(output_path, html)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to generate %s from clarification", stored_name)
-                say(f"Generation failed for `{stored_name}`: {exc}")
+                say(generation_failure_message(stored_name, exc))
                 return
 
             say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")
@@ -1213,7 +1340,7 @@ def create_slack_app(config: AppConfig) -> Any:
                 say(chat_with_claude(anthropic, config, command.prompt or ""))
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to answer chat message")
-                say(f"Chat failed: {exc}")
+                say(chat_failure_message(exc))
             return
         assert command.filename is not None
         assert command.prompt is not None
@@ -1227,7 +1354,7 @@ def create_slack_app(config: AppConfig) -> Any:
             write_text_file(output_path, html)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to generate %s", stored_name)
-            say(f"Generation failed for `{stored_name}`: {exc}")
+            say(generation_failure_message(stored_name, exc))
             return
 
         say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")

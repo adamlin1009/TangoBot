@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +22,7 @@ def _get_helper(module, *names):
     pytest.fail(f"None of these helpers exist on app: {', '.join(names)}")
 
 
-def _test_config(app, state_file=None):
+def _test_config(app, state_file=None, web_search_enabled=True):
     return app.AppConfig(
         slack_bot_token="xoxb-test",
         slack_app_token="xapp-test",
@@ -30,7 +31,7 @@ def _test_config(app, state_file=None):
         sites_dir=app.Path("/tmp/sites"),
         tailscale_bin="tailscale",
         tailscale_base_url="https://example.ts.net",
-        web_search_enabled=True,
+        web_search_enabled=web_search_enabled,
         web_search_max_uses=3,
         state_file=state_file or app.Path("/tmp/tangobot-test-state.json"),
     )
@@ -112,20 +113,20 @@ def test_parse_generate_command():
         "parse_message",
     )
 
-    parsed = parse_command("generate market-map.html enterprise AI landscape")
+    parsed = parse_command("generate market-map.html enterprise AI landscape with categories and vendor examples")
 
     if isinstance(parsed, dict):
         assert parsed.get("action", parsed.get("kind")) == "generate"
         assert parsed.get("filename") == "market-map.html"
-        assert parsed.get("prompt") == "enterprise AI landscape"
+        assert parsed.get("prompt") == "enterprise AI landscape with categories and vendor examples"
     elif hasattr(parsed, "kind"):
         assert parsed.kind == "generate"
         assert parsed.filename == "market-map.html"
-        assert parsed.prompt == "enterprise AI landscape"
+        assert parsed.prompt == "enterprise AI landscape with categories and vendor examples"
     else:
         assert parsed[0] == "generate"
         assert parsed[1] == "market-map.html"
-        assert parsed[2] == "enterprise AI landscape"
+        assert parsed[2] == "enterprise AI landscape with categories and vendor examples"
 
 
 def test_parse_generate_without_prompt_infers_from_filename():
@@ -171,11 +172,13 @@ def test_detailed_filename_request_skips_clarification():
         "parse_message",
     )
 
-    parsed = parse_command("generate market-map.html everything relevant to ai enterprise landscape use web search")
+    parsed = parse_command(
+        "generate market-map.html enterprise AI landscape with categories, companies, funding, and stage"
+    )
 
     assert parsed.kind == "generate"
     assert parsed.filename == "market-map.html"
-    assert parsed.prompt == "everything relevant to ai enterprise landscape use web search"
+    assert parsed.prompt == "enterprise AI landscape with categories, companies, funding, and stage"
 
 
 def test_parse_plain_language_routes_for_claude_intent():
@@ -197,19 +200,47 @@ def test_parse_plain_language_routes_for_claude_intent():
 def test_route_message_intent_can_generate_from_plain_language():
     app = _load_app_module()
     route_message_intent = _get_helper(app, "route_message_intent")
+    prompt = (
+        "make me a marketplace map for enterprise ai with categories, "
+        "vendor examples, buyer fit, and funding stage"
+    )
     fake_anthropic = _FakeAnthropic(
-        '{"action":"generate","filename":null,"prompt":"make me a marketplace map for enterprise ai"}'
+        json.dumps(
+            {
+                "action": "generate",
+                "filename": "marketplace-map-enterprise-ai.html",
+                "prompt": prompt,
+            }
+        )
     )
 
     parsed = route_message_intent(
         fake_anthropic,
         _test_config(app),
-        "make me a marketplace map for enterprise ai",
+        prompt,
     )
 
     assert parsed.kind == "generate"
     assert parsed.filename == "marketplace-map-enterprise-ai.html"
-    assert parsed.prompt == "make me a marketplace map for enterprise ai"
+    assert parsed.prompt == prompt
+
+
+def test_route_message_intent_clarifies_broad_marketplace_map_for_enterprise_agents():
+    app = _load_app_module()
+    route_message_intent = _get_helper(app, "route_message_intent")
+    fake_anthropic = _FakeAnthropic(
+        '{"action":"generate","filename":null,"prompt":"make me a marketplace map for enterprise agents"}'
+    )
+
+    parsed = route_message_intent(
+        fake_anthropic,
+        _test_config(app),
+        "make me a marketplace map for enterprise agents",
+    )
+
+    assert parsed.kind == "clarify"
+    assert parsed.filename == "marketplace-map-enterprise-agents.html"
+    assert parsed.question == "What audience, categories, or source material should this map use?"
 
 
 def test_route_message_intent_can_chat_from_plain_language():
@@ -228,6 +259,21 @@ def test_route_message_intent_can_chat_from_plain_language():
     assert parsed.kind == "chat"
     assert parsed.filename is None
     assert parsed.prompt == "What can you help me with?"
+
+
+def test_route_message_intent_truncates_large_router_input():
+    app = _load_app_module()
+    route_message_intent = _get_helper(app, "route_message_intent")
+    fake_anthropic = _FakeAnthropic(
+        '{"action":"chat","filename":null,"prompt":"summarize this"}'
+    )
+    long_text = "summarize this " + ("x" * (app.MAX_ROUTER_INPUT_CHARS + 100))
+
+    route_message_intent(fake_anthropic, _test_config(app), long_text)
+
+    sent_text = fake_anthropic.requests[0]["messages"][0]["content"]
+    assert len(sent_text) < len(long_text)
+    assert f"[Truncated after {app.MAX_ROUTER_INPUT_CHARS} characters.]" in sent_text
 
 
 def test_route_message_intent_can_clarify_thin_generation_request():
@@ -450,6 +496,28 @@ def test_web_search_tools_can_be_enabled():
     ]
 
 
+def test_web_search_tools_are_omitted_when_disabled():
+    app = _load_app_module()
+    web_search_tools = _get_helper(app, "web_search_tools")
+    config = _test_config(app, web_search_enabled=False)
+
+    assert web_search_tools(config) == []
+
+
+def test_chat_with_claude_truncates_large_prompt_input():
+    app = _load_app_module()
+    chat_with_claude = _get_helper(app, "chat_with_claude")
+    fake_anthropic = _SequenceAnthropic(["ok"])
+    long_prompt = "question " + ("x" * (app.MAX_MODEL_INPUT_CHARS + 100))
+
+    response = chat_with_claude(fake_anthropic, _test_config(app, web_search_enabled=False), long_prompt)
+
+    sent_text = fake_anthropic.requests[0]["messages"][0]["content"]
+    assert response == "ok"
+    assert len(sent_text) < len(long_prompt)
+    assert f"[Truncated after {app.MAX_MODEL_INPUT_CHARS} characters.]" in sent_text
+
+
 def test_sources_section_is_appended_before_body_close():
     app = _load_app_module()
     append_sources_section = _get_helper(app, "append_sources_section")
@@ -510,12 +578,15 @@ def test_build_generation_prompt_preserves_filename_and_user_prompt():
     app = _load_app_module()
     build_generation_prompt = _get_helper(app, "build_generation_prompt")
 
-    prompt = build_generation_prompt("everything relevant to ai enterprise landscape use web search", "market-map.html")
+    prompt = build_generation_prompt(
+        "enterprise AI landscape with categories, companies, funding, and stage",
+        "market-map.html",
+    )
 
     assert "Requested filename: market-map.html" in prompt
-    assert "everything relevant to ai enterprise landscape use web search" in prompt
+    assert "enterprise AI landscape with categories, companies, funding, and stage" in prompt
     assert "Maps should become structured visual landscapes" in prompt
-    assert "use web search" in prompt
+    assert "avoid unsupported claims about current facts" in prompt
 
 
 def test_pending_clarification_state_round_trips(tmp_path):
@@ -566,6 +637,38 @@ def test_generate_html_returns_valid_first_response_without_retry():
     assert len(fake_anthropic.requests) == 1
 
 
+def test_generate_html_does_not_send_web_search_tools_when_disabled():
+    app = _load_app_module()
+    generate_html = _get_helper(app, "generate_html")
+    valid_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Market Map</h1></body></html>"
+    fake_anthropic = _SequenceAnthropic([valid_html])
+
+    html = generate_html(
+        fake_anthropic,
+        _test_config(app, web_search_enabled=False),
+        "enterprise AI landscape",
+        "market-map.html",
+    )
+
+    assert html == valid_html
+    assert "tools" not in fake_anthropic.requests[0]
+    assert "Do not claim to have browsed the web" in fake_anthropic.requests[0]["system"]
+
+
+def test_generate_html_truncates_large_prompt_input():
+    app = _load_app_module()
+    generate_html = _get_helper(app, "generate_html")
+    valid_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Market Map</h1></body></html>"
+    fake_anthropic = _SequenceAnthropic([valid_html])
+    long_prompt = "make a page " + ("x" * (app.MAX_MODEL_INPUT_CHARS + 100))
+
+    generate_html(fake_anthropic, _test_config(app), long_prompt, "page.html")
+
+    sent_text = fake_anthropic.requests[0]["messages"][0]["content"]
+    assert len(sent_text) < len(long_prompt) + 1000
+    assert f"[Truncated after {app.MAX_MODEL_INPUT_CHARS} characters.]" in sent_text
+
+
 def test_generate_html_cleans_preamble_without_retry():
     app = _load_app_module()
     generate_html = _get_helper(app, "generate_html")
@@ -589,6 +692,7 @@ def test_generate_html_retries_once_after_invalid_response():
     assert html == valid_html
     assert len(fake_anthropic.requests) == 2
     assert "Validation error" in fake_anthropic.requests[1]["messages"][-1]["content"]
+    assert all(message["role"] != "assistant" for message in fake_anthropic.requests[1]["messages"])
 
 
 def test_generate_html_invalid_retry_raises_runtime_error():
@@ -653,3 +757,16 @@ def test_extracts_text_and_sources_from_dict_blocks():
     assert extract_cited_sources(blocks) == [
         {"url": "https://example.com/source", "title": "Example Source"}
     ]
+
+
+def test_generation_rate_limit_message_is_user_friendly():
+    app = _load_app_module()
+    generation_failure_message = _get_helper(app, "generation_failure_message")
+
+    message = generation_failure_message(
+        "market-map.html",
+        RuntimeError("Error code: 429 - request would exceed input tokens per minute"),
+    )
+
+    assert "model rate limit" in message
+    assert "429" not in message

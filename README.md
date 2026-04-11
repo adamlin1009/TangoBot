@@ -2,6 +2,8 @@
 
 Minimal Slack DM bot for publishing single-file HTML pages to a tailnet via Tailscale Serve.
 
+TangoBot is in beta testing. Expect rough edges, and review generated pages before sharing them broadly.
+
 ## What v1 does
 
 - Accepts Slack DMs only.
@@ -44,11 +46,9 @@ pip install -r requirements.txt
 
 - `connections:write`
 
-5. In the Anthropic Console, enable web search for the API organization if it is not already enabled.
+5. Install Tailscale on the host machine and sign in.
 
-6. Install Tailscale on the host machine and sign in.
-
-7. Make sure the `tailscale` CLI works on the host machine. The app will run `tailscale serve --bg <sites_dir>` for you on startup. If you want to verify it manually first, use:
+6. Make sure the `tailscale` CLI works on the host machine. The app will run `tailscale serve --bg <sites_dir>` for you on startup. If you want to verify it manually first, use:
 
 ```bash
 tailscale serve --bg /absolute/path/to/sites
@@ -58,7 +58,7 @@ tailscale serve --bg /absolute/path/to/sites
 
 Copy `.env.example` to `.env` and fill in the values. `TAILSCALE_BASE_URL` is optional; if omitted, the app derives it from `tailscale status --json`.
 
-`ANTHROPIC_WEB_SEARCH=1` is enabled by default so Claude can look up current market data, companies, pricing, and other fresh facts. Web search uses Anthropic's paid search tool in addition to normal token usage. Set `ANTHROPIC_WEB_SEARCH=0` to disable it.
+`ANTHROPIC_WEB_SEARCH=0` is the default. This keeps broad page-generation prompts smaller and avoids search/tool context inflating token usage. If you explicitly want live web research, set `ANTHROPIC_WEB_SEARCH=1` and keep `ANTHROPIC_WEB_SEARCH_MAX_USES` low.
 
 `TANGOBOT_STATE_FILE` is optional. It defaults to `~/.tangobot/pending_clarifications.json` and stores pending one-question clarification flows across bot restarts.
 
@@ -81,20 +81,21 @@ Send the bot a DM in one of these forms:
 ```text
 help
 what can you help me build?
-what are the current enterprise AI trends?
+summarize these customer notes into themes
 generate market-map.html enterprise AI landscape with columns for category, company, funding, and stage
 generate market-map.html
-make me a market map for the enterprise AI landscape
-make me a marketplace map for enterprise AI
-create market-map.html for the enterprise AI landscape
+make me a market map for the enterprise AI landscape with buyer categories and vendor examples
+make me a marketplace map for enterprise AI with categories and vendor examples
+create market-map.html for the enterprise AI landscape with categories and vendor examples
 ```
 
-For natural-language requests, the bot picks a readable filename and asks Claude to infer a complete page structure with illustrative content. If a request is too thin, such as only a filename or an artifact type without a subject, the bot asks one clarification question and uses the next DM reply to generate the page. Reply `cancel` to clear a pending clarification. You can also paste source notes, lists, or URLs directly into the message.
+For natural-language requests, the bot picks a readable filename and asks Claude to infer a complete page structure with illustrative content. If a request is too thin, such as only a filename, an artifact type without a subject, or a broad market-map request without enough detail, the bot asks one clarification question and uses the next DM reply to generate the page. Reply `cancel` to clear a pending clarification. You can also paste source notes, lists, or URLs directly into the message.
 
 If a user uploads an `.html` file in a DM, the bot saves it and returns the tailnet URL. If a user uploads a `.jsx` file, it must be one self-contained React component using global `React`; the bot saves the `.jsx` source and publishes a wrapped `.html` page that loads React, ReactDOM, and Babel from CDNs. If a user uploads `.txt`, `.md`, `.csv`, or `.json` files with a request, the bot uses those files as source material for the generated page.
 
 ## Notes
 
 - Filenames are automatically prefixed with the Slack user ID to avoid collisions.
+- Model inputs are capped before Anthropic calls. Long Slack messages, route-classification input, and uploaded source material are truncated to avoid bloating context and hitting token-per-minute limits.
 - The host machine must stay online for pages to remain reachable.
 - Access is limited to users on the tailnet.
