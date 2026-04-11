@@ -32,6 +32,9 @@ HELP_TEXT = (
     "*Publish an existing HTML or JSX file*\n"
     "Upload a single `.html` file in this DM and I will publish it directly. "
     "Upload a single self-contained `.jsx` React component with no imports and I will publish both the source and a runnable HTML page.\n\n"
+    "*Revise published pages*\n"
+    "After I publish a page, say `revise it to ...`, `add ...`, or `revise filename.html ...` to update the same URL. "
+    "Use `rollback` to restore the previous version and `history` to list recent pages.\n\n"
     "*Filenames and access*\n"
     "Generated pages get readable filenames automatically. Uploaded or requested filenames are prefixed with your Slack user ID to avoid collisions. "
     "Anyone on the company tailnet can view the returned link.\n\n"
@@ -95,8 +98,12 @@ ROUTER_SYSTEM_PROMPT = (
 SOURCE_FILE_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json"}
 ARTIFACT_FILE_SUFFIXES = {".html", ".jsx"}
 DEFAULT_STATE_FILE = Path.home() / ".tangobot" / "pending_clarifications.json"
+DEFAULT_HISTORY_FILE = Path.home() / ".tangobot" / "page_history.json"
+DEFAULT_VERSIONS_DIR = Path.home() / ".tangobot" / "page_versions"
 MAX_ROUTER_INPUT_CHARS = 3000
 MAX_MODEL_INPUT_CHARS = 12000
+MAX_REVISION_HTML_CHARS = 8000
+MAX_REVISION_CONTEXT_CHARS = 2000
 MAX_SOURCE_FILE_CHARS = 12000
 MAX_TOTAL_SOURCE_CHARS = 20000
 MAX_SLACK_MESSAGE_CHARS = 3500
@@ -178,6 +185,8 @@ class AppConfig:
     web_search_enabled: bool
     web_search_max_uses: int
     state_file: Path = DEFAULT_STATE_FILE
+    history_file: Path = DEFAULT_HISTORY_FILE
+    versions_dir: Path = DEFAULT_VERSIONS_DIR
 
 
 @dataclass(frozen=True)
@@ -313,6 +322,20 @@ BROAD_MARKET_MAP_DETAIL_PATTERN = re.compile(
 )
 BROAD_MARKET_MAP_PATTERN = re.compile(
     r"\b(market\s+map|marketplace\s+map|landscape|matrix|ecosystem)\b",
+    re.IGNORECASE,
+)
+REVISION_COMMAND_PATTERN = re.compile(r"^(revise|edit|update)\b(?:\s+(.+))?$", re.IGNORECASE | re.DOTALL)
+REVISION_START_PATTERN = re.compile(
+    r"^\s*(add|remove|delete|replace|change|use|switch|tweak|polish|simplify|include|exclude|highlight)\b",
+    re.IGNORECASE,
+)
+REVISION_TARGET_PATTERN = re.compile(
+    r"\b(it|this|that|last one|current page|the page|the map|the dashboard|the site|the last one)\b",
+    re.IGNORECASE,
+)
+REVISION_ACTION_PATTERN = re.compile(
+    r"\b(add|remove|delete|replace|change|revise|edit|update|tweak|polish|simplify|clean|cleaner|"
+    r"use|turn|switch|highlight|include|exclude|shorter|longer|darker|lighter|more|less)\b",
     re.IGNORECASE,
 )
 
@@ -452,6 +475,31 @@ def is_cancel_text(text: str | None) -> bool:
     return (text or "").strip().lower() in CANCEL_ALIASES
 
 
+def build_revision_prompt(entry: dict[str, Any], instructions: str, current_html: str) -> str:
+    requested_filename = str(entry.get("requested_filename") or entry.get("stored_name") or "page.html")
+    original_prompt = truncate_text(str(entry.get("original_prompt") or ""), MAX_REVISION_CONTEXT_CHARS)
+    last_prompt = truncate_text(str(entry.get("last_prompt") or ""), MAX_REVISION_CONTEXT_CHARS)
+    bounded_instructions = truncate_text(instructions.strip(), MAX_REVISION_CONTEXT_CHARS)
+    bounded_html = truncate_text(current_html, MAX_REVISION_HTML_CHARS)
+    source_filenames = entry.get("source_filenames") if isinstance(entry.get("source_filenames"), list) else []
+    source_line = f"Source files used previously: {', '.join(map(str, source_filenames))}\n" if source_filenames else ""
+
+    return (
+        "Revise the existing published HTML page while preserving the user's intent and improving only what was requested.\n\n"
+        f"Requested filename: {requested_filename}\n"
+        f"{source_line}"
+        "Original request:\n"
+        f"{original_prompt or '(not recorded)'}\n\n"
+        "Most recent request or revision:\n"
+        f"{last_prompt or '(not recorded)'}\n\n"
+        "Revision instructions:\n"
+        f"{bounded_instructions}\n\n"
+        "Current live HTML:\n"
+        f"{bounded_html}\n\n"
+        "Return a complete replacement HTML document. Keep the same overall artifact unless the revision explicitly asks for a change."
+    )
+
+
 def filename_from_source_files(files: list[dict[str, Any]]) -> str:
     first_name = files[0].get("name", "source") if files else "source"
     return normalize_html_filename(first_name)
@@ -488,6 +536,35 @@ def local_generation_hint(text: str) -> Command | None:
     return None
 
 
+def parse_revision_command(text: str) -> Command | None:
+    match = REVISION_COMMAND_PATTERN.match(text.strip())
+    if not match:
+        return None
+
+    verb = match.group(1).lower()
+    remainder = (match.group(2) or "").strip()
+    if not remainder:
+        return Command(kind="revise", prompt="")
+
+    filename, prompt = extract_requested_filename(remainder)
+    prompt = re.sub(r"^(to|and)\s+", "", prompt, flags=re.IGNORECASE).strip()
+    if not filename and verb in {"edit", "update"} and not REVISION_TARGET_PATTERN.search(remainder):
+        return None
+    return Command(kind="revise", filename=filename, prompt=prompt or remainder)
+
+
+def parse_optional_filename_command(text: str, kind: str) -> Command | None:
+    match = re.match(rf"^{kind}\b(?:\s+(.+))?$", text.strip(), re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+
+    remainder = (match.group(1) or "").strip()
+    filename = None
+    if remainder:
+        filename, _ = extract_requested_filename(remainder)
+    return Command(kind=kind.lower(), filename=filename)
+
+
 def parse_command(text: str | None) -> Command | None:
     if not text or not text.strip():
         return None
@@ -495,6 +572,15 @@ def parse_command(text: str | None) -> Command | None:
     stripped = text.strip()
     if stripped.lower() in HELP_ALIASES:
         return Command(kind="help")
+
+    for kind in ("rollback", "history"):
+        command = parse_optional_filename_command(stripped, kind)
+        if command:
+            return command
+
+    revision_command = parse_revision_command(stripped)
+    if revision_command:
+        return revision_command
 
     match = re.match(r"^generate\s+(\S+\.html)(?:\s+(.+))?$", stripped, re.IGNORECASE | re.DOTALL)
     if match:
@@ -524,6 +610,23 @@ def fallback_route_message_intent(text: str) -> Command:
     if looks_like_generation_request(text):
         return generation_or_clarification_command(filename_from_prompt(text), text)
     return Command(kind="chat", prompt=text)
+
+
+def looks_like_revision_request(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped or looks_like_generation_request(stripped):
+        return False
+    if parse_revision_command(stripped):
+        return True
+    if REVISION_START_PATTERN.search(stripped):
+        return True
+    if re.match(
+        r"^\s*(make|turn)\s+(it|this|that|the page|the map|the dashboard|the site|the last one)\b",
+        stripped,
+        re.IGNORECASE,
+    ):
+        return True
+    return bool(REVISION_TARGET_PATTERN.search(stripped) and REVISION_ACTION_PATTERN.search(stripped))
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -848,6 +951,7 @@ def command_for_source_generation(text: str | None, source_files: list[dict[str,
 
 
 def write_text_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
 
@@ -898,6 +1002,338 @@ def clear_pending_clarification(config: AppConfig, slack_user_id: str) -> None:
         save_pending_clarifications(config.state_file, state)
 
 
+def load_page_history(history_file: Path) -> dict[str, dict[str, Any]]:
+    if not history_file.exists():
+        return {}
+
+    try:
+        payload = json.loads(history_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    history: dict[str, dict[str, Any]] = {}
+    for user_id, user_state in payload.items():
+        if not isinstance(user_state, dict):
+            continue
+        pages = user_state.get("pages")
+        if not isinstance(pages, dict):
+            pages = {}
+        history[str(user_id)] = {
+            "last_stored_name": user_state.get("last_stored_name"),
+            "pages": {
+                str(stored_name): entry
+                for stored_name, entry in pages.items()
+                if isinstance(entry, dict)
+            },
+        }
+    return history
+
+
+def save_page_history(history_file: Path, history: dict[str, dict[str, Any]]) -> None:
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    history_file.write_text(json.dumps(history, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def version_snapshot_path(config: AppConfig, stored_name: str, version: int) -> Path:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(stored_name).name)
+    stem = Path(safe_name).stem or "page"
+    return config.versions_dir / f"{stem}.v{version}.html"
+
+
+def write_version_snapshot(config: AppConfig, stored_name: str, version: int, html: str) -> Path:
+    snapshot_path = version_snapshot_path(config, stored_name, version)
+    write_text_file(snapshot_path, html)
+    return snapshot_path
+
+
+def int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def next_page_version(entry: dict[str, Any]) -> int:
+    versions = entry.get("versions")
+    if not isinstance(versions, list):
+        return 1
+    version_numbers = [int_value(version.get("version")) for version in versions if isinstance(version, dict)]
+    return max(version_numbers, default=0) + 1
+
+
+def normalize_version_summary(summary: str | None, publish_kind: str) -> str:
+    text = re.sub(r"\s+", " ", (summary or "").strip())
+    if not text:
+        return publish_kind
+    if len(text) > 120:
+        return f"{text[:117].rstrip()}..."
+    return text
+
+
+def record_page_publish(
+    config: AppConfig,
+    slack_user_id: str,
+    requested_filename: str,
+    stored_name: str,
+    html: str,
+    prompt: str | None,
+    *,
+    publish_kind: str = "published",
+    source_filenames: list[str] | None = None,
+) -> dict[str, Any]:
+    history = load_page_history(config.history_file)
+    user_state = history.setdefault(slack_user_id, {"last_stored_name": None, "pages": {}})
+    pages = user_state.setdefault("pages", {})
+    if not isinstance(pages, dict):
+        pages = {}
+        user_state["pages"] = pages
+
+    stored_name = Path(stored_name).name
+    requested_filename = normalize_html_filename(requested_filename)
+    entry = pages.get(stored_name)
+    if not isinstance(entry, dict):
+        entry = {
+            "requested_filename": requested_filename,
+            "stored_name": stored_name,
+            "original_prompt": prompt or "",
+            "versions": [],
+            "created_at": time.time(),
+        }
+
+    versions = entry.get("versions")
+    if not isinstance(versions, list):
+        versions = []
+    version = next_page_version(entry)
+    snapshot_path = write_version_snapshot(config, stored_name, version, html)
+    now = time.time()
+
+    versions.append(
+        {
+            "version": version,
+            "path": str(snapshot_path),
+            "created_at": now,
+            "summary": normalize_version_summary(prompt, publish_kind),
+            "kind": publish_kind,
+        }
+    )
+    entry.update(
+        {
+            "requested_filename": requested_filename,
+            "stored_name": stored_name,
+            "last_prompt": prompt or entry.get("last_prompt", ""),
+            "current_version": version,
+            "updated_at": now,
+            "versions": versions,
+        }
+    )
+    if not entry.get("original_prompt"):
+        entry["original_prompt"] = prompt or ""
+    if source_filenames is not None:
+        entry["source_filenames"] = list(source_filenames)
+
+    pages[stored_name] = entry
+    user_state["last_stored_name"] = stored_name
+    save_page_history(config.history_file, history)
+    return entry
+
+
+def resolve_page_entry_from_history(
+    history: dict[str, dict[str, Any]],
+    slack_user_id: str,
+    target_filename: str | None = None,
+) -> tuple[str, dict[str, Any]] | None:
+    user_state = history.get(slack_user_id)
+    if not isinstance(user_state, dict):
+        return None
+    pages = user_state.get("pages")
+    if not isinstance(pages, dict) or not pages:
+        return None
+
+    if not target_filename:
+        last_stored_name = user_state.get("last_stored_name")
+        entry = pages.get(last_stored_name) if isinstance(last_stored_name, str) else None
+        if isinstance(entry, dict):
+            return last_stored_name, entry
+        recent_pages = sorted(
+            [(stored_name, entry) for stored_name, entry in pages.items() if isinstance(entry, dict)],
+            key=lambda item: float_value(item[1].get("updated_at") or item[1].get("created_at")),
+            reverse=True,
+        )
+        if recent_pages:
+            return recent_pages[0]
+        return None
+
+    raw_name = Path(target_filename).name
+    normalized_name = normalize_html_filename(raw_name)
+    candidates = {
+        raw_name,
+        normalized_name,
+        build_site_filename(slack_user_id, normalized_name),
+    }
+    for stored_name, entry in pages.items():
+        if not isinstance(entry, dict):
+            continue
+        if stored_name in candidates:
+            return stored_name, entry
+        if entry.get("stored_name") in candidates:
+            return stored_name, entry
+        if entry.get("requested_filename") in candidates:
+            return stored_name, entry
+    return None
+
+
+def resolve_page_entry(
+    config: AppConfig,
+    slack_user_id: str,
+    target_filename: str | None = None,
+) -> tuple[str, dict[str, Any]] | None:
+    return resolve_page_entry_from_history(load_page_history(config.history_file), slack_user_id, target_filename)
+
+
+def command_for_natural_revision(config: AppConfig, slack_user_id: str, text: str) -> Command | None:
+    if not resolve_page_entry(config, slack_user_id):
+        return None
+    if looks_like_revision_request(text):
+        return Command(kind="revise", prompt=text.strip())
+    return None
+
+
+def revise_published_page(
+    anthropic: Any,
+    config: AppConfig,
+    slack_user_id: str,
+    target_filename: str | None,
+    instructions: str,
+) -> dict[str, Any]:
+    instructions = instructions.strip()
+    if not instructions:
+        raise ValueError("Tell me what to change, for example `revise it to make the layout cleaner`.")
+
+    resolved = resolve_page_entry(config, slack_user_id, target_filename)
+    if not resolved:
+        raise LookupError("I could not find a published page to revise. Generate or upload a page first.")
+
+    stored_name, entry = resolved
+    live_path = config.sites_dir / stored_name
+    if not live_path.exists():
+        raise FileNotFoundError(f"The live page `{stored_name}` is missing from the sites directory.")
+
+    current_html = live_path.read_text(encoding="utf-8")
+    requested_filename = str(entry.get("requested_filename") or stored_name)
+    revision_prompt = build_revision_prompt(entry, instructions, current_html)
+    html = generate_html(anthropic, config, revision_prompt, requested_filename)
+    write_text_file(live_path, html)
+    return record_page_publish(
+        config,
+        slack_user_id,
+        requested_filename,
+        stored_name,
+        html,
+        instructions,
+        publish_kind="revision",
+        source_filenames=entry.get("source_filenames") if isinstance(entry.get("source_filenames"), list) else None,
+    )
+
+
+def rollback_published_page(
+    config: AppConfig,
+    slack_user_id: str,
+    target_filename: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    history = load_page_history(config.history_file)
+    resolved = resolve_page_entry_from_history(history, slack_user_id, target_filename)
+    if not resolved:
+        raise LookupError("I could not find a published page to roll back.")
+
+    stored_name, entry = resolved
+    current_version = int_value(entry.get("current_version"))
+    versions = entry.get("versions")
+    if not isinstance(versions, list):
+        versions = []
+    prior_versions = [
+        version
+        for version in versions
+        if isinstance(version, dict) and 0 < int_value(version.get("version")) < current_version
+    ]
+    if not prior_versions:
+        raise RuntimeError(f"`{stored_name}` does not have an older version to restore.")
+
+    target_version = max(prior_versions, key=lambda version: int_value(version.get("version")))
+    snapshot_path = Path(str(target_version.get("path") or ""))
+    if not snapshot_path.exists():
+        raise FileNotFoundError(f"Snapshot for `{stored_name}` v{target_version.get('version')} is missing.")
+
+    write_text_file(config.sites_dir / stored_name, snapshot_path.read_text(encoding="utf-8"))
+    entry["current_version"] = int_value(target_version.get("version"))
+    entry["last_prompt"] = target_version.get("summary") or entry.get("last_prompt", "")
+    entry["updated_at"] = time.time()
+    user_state = history.setdefault(slack_user_id, {"last_stored_name": None, "pages": {}})
+    user_state["last_stored_name"] = stored_name
+    save_page_history(config.history_file, history)
+    return stored_name, entry
+
+
+def format_recent_pages_response(config: AppConfig, slack_user_id: str) -> str:
+    history = load_page_history(config.history_file)
+    user_state = history.get(slack_user_id)
+    pages = user_state.get("pages") if isinstance(user_state, dict) else None
+    if not isinstance(pages, dict) or not pages:
+        return "No published pages yet."
+
+    recent_pages = sorted(
+        [(stored_name, entry) for stored_name, entry in pages.items() if isinstance(entry, dict)],
+        key=lambda item: float_value(item[1].get("updated_at") or item[1].get("created_at")),
+        reverse=True,
+    )
+    lines = ["Recent pages:"]
+    for stored_name, entry in recent_pages[:8]:
+        requested = entry.get("requested_filename") or stored_name
+        lines.append(f"- `{requested}` (v{int_value(entry.get('current_version'), 1)}): {publish_url(config, stored_name)}")
+    return "\n".join(lines)
+
+
+def format_page_history_response(config: AppConfig, slack_user_id: str, target_filename: str | None) -> str:
+    resolved = resolve_page_entry(config, slack_user_id, target_filename)
+    if not resolved:
+        return "I could not find that page in your published history."
+
+    stored_name, entry = resolved
+    current_version = int_value(entry.get("current_version"))
+    versions = entry.get("versions")
+    if not isinstance(versions, list) or not versions:
+        return f"No saved versions for `{stored_name}` yet."
+
+    lines = [f"History for `{stored_name}` (current v{current_version}):"]
+    sorted_versions = sorted(
+        [version for version in versions if isinstance(version, dict)],
+        key=lambda version: int_value(version.get("version")),
+        reverse=True,
+    )
+    for version in sorted_versions[:8]:
+        version_number = int_value(version.get("version"))
+        marker = " current" if version_number == current_version else ""
+        summary = str(version.get("summary") or version.get("kind") or "published")
+        lines.append(f"- v{version_number}{marker}: {summary}")
+    return "\n".join(lines)
+
+
+def publish_success_message(config: AppConfig, stored_name: str) -> str:
+    return (
+        f"Published `{stored_name}`: {publish_url(config, stored_name)}\n"
+        "To change it, say `revise it to ...`; to undo, say `rollback`."
+    )
+
+
 def run_tailscale_command(config: AppConfig, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [config.tailscale_bin, *args],
@@ -926,6 +1362,9 @@ def load_config() -> AppConfig:
     sites_dir = Path(os.environ.get("SITES_DIR", Path.home() / "sites")).expanduser().resolve()
     sites_dir.mkdir(parents=True, exist_ok=True)
     state_file = Path(os.environ.get("TANGOBOT_STATE_FILE", DEFAULT_STATE_FILE)).expanduser().resolve()
+    history_file = Path(os.environ.get("TANGOBOT_HISTORY_FILE", DEFAULT_HISTORY_FILE)).expanduser().resolve()
+    versions_dir = Path(os.environ.get("TANGOBOT_VERSIONS_DIR", DEFAULT_VERSIONS_DIR)).expanduser().resolve()
+    versions_dir.mkdir(parents=True, exist_ok=True)
 
     tailscale_bin = os.environ.get("TAILSCALE_BIN", "tailscale")
     tailscale_base_url = os.environ.get("TAILSCALE_BASE_URL")
@@ -943,6 +1382,8 @@ def load_config() -> AppConfig:
         web_search_enabled=env_bool("ANTHROPIC_WEB_SEARCH", False),
         web_search_max_uses=max(env_int("ANTHROPIC_WEB_SEARCH_MAX_USES", 2), 1),
         state_file=state_file,
+        history_file=history_file,
+        versions_dir=versions_dir,
     )
 
 
@@ -1235,12 +1676,21 @@ def create_slack_app(config: AppConfig) -> Any:
                 try:
                     html = download_slack_file(client, config.slack_bot_token, file_obj)
                     write_text_file(output_path, html)
+                    record_page_publish(
+                        config,
+                        slack_user_id,
+                        original_name,
+                        stored_name,
+                        html,
+                        f"Uploaded HTML file: {original_name}",
+                        publish_kind="upload",
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Failed to save uploaded file %s", original_name)
                     say(f"Failed to save `{original_name}`: {exc}")
                     continue
 
-                say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")
+                say(publish_success_message(config, stored_name))
 
             for file_obj in jsx_files:
                 original_name = file_obj.get("name", "upload.jsx")
@@ -1255,6 +1705,15 @@ def create_slack_app(config: AppConfig) -> Any:
                     html = wrap_jsx_as_html(jsx_source, page_title)
                     write_text_file(source_path, jsx_source)
                     write_text_file(page_path, html)
+                    record_page_publish(
+                        config,
+                        slack_user_id,
+                        original_name,
+                        page_name,
+                        html,
+                        f"Uploaded JSX file: {original_name}",
+                        publish_kind="jsx upload",
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Failed to publish JSX file %s", original_name)
                     say(f"Failed to publish `{original_name}`: {exc}")
@@ -1262,7 +1721,8 @@ def create_slack_app(config: AppConfig) -> Any:
 
                 say(
                     f"Published `{page_name}`: {publish_url(config, page_name)}\n"
-                    f"Source JSX: {publish_url(config, source_name)}"
+                    f"Source JSX: {publish_url(config, source_name)}\n"
+                    "To change the published page, say `revise it to ...`; to undo, say `rollback`."
                 )
 
             if html_files or jsx_files:
@@ -1302,12 +1762,22 @@ def create_slack_app(config: AppConfig) -> Any:
                         command.filename,
                     )
                     write_text_file(output_path, html)
+                    record_page_publish(
+                        config,
+                        slack_user_id,
+                        command.filename,
+                        stored_name,
+                        html,
+                        command.prompt,
+                        publish_kind="source generation",
+                        source_filenames=[str(material["name"]) for material in source_materials],
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Failed to generate %s from source attachments", stored_name)
                     say(generation_failure_message(stored_name, exc))
                     return
 
-                say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")
+                say(publish_success_message(config, stored_name))
                 return
 
             say(
@@ -1329,6 +1799,49 @@ def create_slack_app(config: AppConfig) -> Any:
             clear_pending_clarification(config, slack_user_id)
             say(HELP_TEXT)
             return
+        if command.kind == "history":
+            clear_pending_clarification(config, slack_user_id)
+            if command.filename:
+                say(format_page_history_response(config, slack_user_id, command.filename))
+            else:
+                say(format_recent_pages_response(config, slack_user_id))
+            return
+        if command.kind == "rollback":
+            clear_pending_clarification(config, slack_user_id)
+            try:
+                stored_name, entry = rollback_published_page(config, slack_user_id, command.filename)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to roll back page")
+                say(f"Rollback failed: {exc}")
+                return
+            say(
+                f"Rolled back `{stored_name}` to v{int_value(entry.get('current_version'))}: "
+                f"{publish_url(config, stored_name)}"
+            )
+            return
+        if command.kind == "revise":
+            clear_pending_clarification(config, slack_user_id)
+            try:
+                target = command.filename or "the last published page"
+                say(f"Revising {target}...")
+                entry = revise_published_page(
+                    anthropic,
+                    config,
+                    slack_user_id,
+                    command.filename,
+                    command.prompt or "",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to revise page")
+                say(f"Revision failed: {exc}")
+                return
+            stored_name = str(entry.get("stored_name"))
+            say(
+                f"Revised `{stored_name}` to v{int_value(entry.get('current_version'))}: "
+                f"{publish_url(config, stored_name)}\n"
+                "To undo, say `rollback`."
+            )
+            return
         if pending:
             filename, clarified_prompt = build_prompt_from_clarification(pending, text)
             stored_name = build_site_filename(slack_user_id, filename)
@@ -1339,15 +1852,50 @@ def create_slack_app(config: AppConfig) -> Any:
                 say(f"Generating `{stored_name}`...")
                 html = generate_html(anthropic, config, clarified_prompt, filename)
                 write_text_file(output_path, html)
+                record_page_publish(
+                    config,
+                    slack_user_id,
+                    filename,
+                    stored_name,
+                    html,
+                    clarified_prompt,
+                    publish_kind="generation",
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to generate %s from clarification", stored_name)
                 say(generation_failure_message(stored_name, exc))
                 return
 
-            say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")
+            say(publish_success_message(config, stored_name))
             return
         if command.kind == "route":
-            command = route_message_intent(anthropic, config, command.prompt or "")
+            command = command_for_natural_revision(config, slack_user_id, command.prompt or "") or route_message_intent(
+                anthropic,
+                config,
+                command.prompt or "",
+            )
+        if command.kind == "revise":
+            try:
+                target = command.filename or "the last published page"
+                say(f"Revising {target}...")
+                entry = revise_published_page(
+                    anthropic,
+                    config,
+                    slack_user_id,
+                    command.filename,
+                    command.prompt or "",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to revise page")
+                say(f"Revision failed: {exc}")
+                return
+            stored_name = str(entry.get("stored_name"))
+            say(
+                f"Revised `{stored_name}` to v{int_value(entry.get('current_version'))}: "
+                f"{publish_url(config, stored_name)}\n"
+                "To undo, say `rollback`."
+            )
+            return
         if command.kind == "clarify":
             set_pending_clarification(config, slack_user_id, command)
             say(command.question or clarification_question_for(command.filename, command.prompt))
@@ -1369,12 +1917,21 @@ def create_slack_app(config: AppConfig) -> Any:
             say(f"Generating `{stored_name}`...")
             html = generate_html(anthropic, config, command.prompt, command.filename)
             write_text_file(output_path, html)
+            record_page_publish(
+                config,
+                slack_user_id,
+                command.filename,
+                stored_name,
+                html,
+                command.prompt,
+                publish_kind="generation",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to generate %s", stored_name)
             say(generation_failure_message(stored_name, exc))
             return
 
-        say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")
+        say(publish_success_message(config, stored_name))
 
     return app
 

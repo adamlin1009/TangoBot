@@ -12,15 +12,16 @@ TangoBot is in beta testing. Expect rough edges, and review generated pages befo
 - Accepts `.html` file uploads and saves them directly.
 - Accepts `.jsx` React component uploads and publishes both the source and a runnable `.html` page.
 - Accepts `.txt`, `.md`, `.csv`, and `.json` uploads as source material for generation.
+- Revises the last published page or an explicitly named page while keeping the same URL.
+- Keeps private version snapshots and supports `rollback` plus `history`.
 - Publishes files from a local `sites/` directory over Tailscale.
 - Replies with the tailnet URL for the saved page.
 
 ## What v1 does not do
 
-- No `revise` flow.
 - No generated JSX; Claude-generated pages are still published as HTML.
 - No JSX imports, npm packages, local assets, CSS imports, or multi-file React apps.
-- No database, version history, or deployment pipeline.
+- No database or deployment pipeline.
 
 ## Setup
 
@@ -62,6 +63,8 @@ Copy `.env.example` to `.env` and fill in the values. `TAILSCALE_BASE_URL` is op
 
 `TANGOBOT_STATE_FILE` is optional. It defaults to `~/.tangobot/pending_clarifications.json` and stores pending one-question clarification flows across bot restarts.
 
+`TANGOBOT_HISTORY_FILE` and `TANGOBOT_VERSIONS_DIR` are optional. They default to `~/.tangobot/page_history.json` and `~/.tangobot/page_versions`. Version snapshots are stored outside `sites/`, so only the current live page is served.
+
 The default model is `claude-sonnet-4-6`. For deeper reasoning at higher cost, set `ANTHROPIC_MODEL=claude-opus-4-6`.
 
 On Windows, if you already configured Tailscale Serve once from an administrator shell, set `SKIP_TAILSCALE_SERVE=1` so normal bot restarts do not need administrator permissions.
@@ -84,6 +87,10 @@ what can you help me build?
 summarize these customer notes into themes
 generate market-map.html enterprise AI landscape with columns for category, company, funding, and stage
 generate market-map.html
+revise it to make the layout cleaner
+revise market-map.html add a funding stage column
+rollback
+history
 make me a market map for the enterprise AI landscape with buyer categories and vendor examples
 make me a marketplace map for enterprise AI with categories and vendor examples
 create market-map.html for the enterprise AI landscape with categories and vendor examples
@@ -93,9 +100,12 @@ For natural-language requests, the bot picks a readable filename and asks Claude
 
 If a user uploads an `.html` file in a DM, the bot saves it and returns the tailnet URL. If a user uploads a `.jsx` file, it must be one self-contained React component using global `React`; the bot saves the `.jsx` source and publishes a wrapped `.html` page that loads React, ReactDOM, and Babel from CDNs. If a user uploads `.txt`, `.md`, `.csv`, or `.json` files with a request, the bot uses those files as source material for the generated page.
 
+After a page is published, reply with natural revision instructions such as `make it more executive`, `add a pricing section`, or `revise market-map.html use a cleaner layout`. Revisions update the same live URL and save private snapshots for rollback. Use `rollback` to restore the previous version of the last page, or `history` to list recent pages and version numbers.
+
 ## Notes
 
 - Filenames are automatically prefixed with the Slack user ID to avoid collisions.
+- Revisions keep the same published URL; old versions are private files used only for rollback.
 - Model inputs are capped before Anthropic calls. Long Slack messages, route-classification input, and uploaded source material are truncated to avoid bloating context and hitting token-per-minute limits.
 - The host machine must stay online for pages to remain reachable.
 - Access is limited to users on the tailnet.

@@ -22,18 +22,20 @@ def _get_helper(module, *names):
     pytest.fail(f"None of these helpers exist on app: {', '.join(names)}")
 
 
-def _test_config(app, state_file=None, web_search_enabled=True):
+def _test_config(app, state_file=None, web_search_enabled=True, history_file=None, versions_dir=None, sites_dir=None):
     return app.AppConfig(
         slack_bot_token="xoxb-test",
         slack_app_token="xapp-test",
         anthropic_api_key="sk-ant-test",
         anthropic_model="claude-sonnet-4-6",
-        sites_dir=app.Path("/tmp/sites"),
+        sites_dir=sites_dir or app.Path("/tmp/sites"),
         tailscale_bin="tailscale",
         tailscale_base_url="https://example.ts.net",
         web_search_enabled=web_search_enabled,
         web_search_max_uses=3,
         state_file=state_file or app.Path("/tmp/tangobot-test-state.json"),
+        history_file=history_file or app.Path("/tmp/tangobot-test-history.json"),
+        versions_dir=versions_dir or app.Path("/tmp/tangobot-test-versions"),
     )
 
 
@@ -345,6 +347,55 @@ def test_parse_plain_language_uses_mentioned_html_filename():
     assert parsed.prompt == "enterprise AI startups"
 
 
+def test_parse_revision_rollback_and_history_commands():
+    app = _load_app_module()
+    parse_command = _get_helper(app, "parse_command")
+
+    revised = parse_command("revise market-map.html to add a funding stage column")
+    assert revised.kind == "revise"
+    assert revised.filename == "market-map.html"
+    assert revised.prompt == "add a funding stage column"
+
+    last_page_revision = parse_command("edit it to be cleaner")
+    assert last_page_revision.kind == "revise"
+    assert last_page_revision.filename is None
+    assert last_page_revision.prompt == "it to be cleaner"
+
+    rollback = parse_command("rollback market-map.html")
+    assert rollback.kind == "rollback"
+    assert rollback.filename == "market-map.html"
+
+    history = parse_command("history")
+    assert history.kind == "history"
+    assert history.filename is None
+
+    chatty_update = parse_command("update me on the latest AI news")
+    assert chatty_update.kind == "route"
+
+
+def test_natural_revision_requires_recent_page_and_skips_generation_requests(tmp_path):
+    app = _load_app_module()
+    command_for_natural_revision = _get_helper(app, "command_for_natural_revision")
+    record_page_publish = _get_helper(app, "record_page_publish")
+    config = _test_config(
+        app,
+        history_file=tmp_path / "history.json",
+        versions_dir=tmp_path / "versions",
+    )
+    html = "<!doctype html><html><head><title>Map</title></head><body><h1>Map</h1></body></html>"
+
+    assert command_for_natural_revision(config, "U12345", "make it cleaner") is None
+
+    record_page_publish(config, "U12345", "market-map.html", "U12345-market-map.html", html, "make a map")
+
+    command = command_for_natural_revision(config, "U12345", "make it cleaner")
+    assert command.kind == "revise"
+    assert command.filename is None
+    assert command.prompt == "make it cleaner"
+
+    assert command_for_natural_revision(config, "U12345", "make me a dashboard for sales") is None
+
+
 def test_prefix_and_slug_filename_helpers():
     app = _load_app_module()
     build_filename = _get_helper(
@@ -627,6 +678,73 @@ def test_pending_clarification_state_round_trips(tmp_path):
     assert get_pending_clarification(config, "U12345") is None
 
 
+def test_page_history_round_trips_and_ignores_malformed_json(tmp_path):
+    app = _load_app_module()
+    load_page_history = _get_helper(app, "load_page_history")
+    record_page_publish = _get_helper(app, "record_page_publish")
+    resolve_page_entry = _get_helper(app, "resolve_page_entry")
+    history_file = tmp_path / "history.json"
+    config = _test_config(app, history_file=history_file, versions_dir=tmp_path / "versions")
+    html = "<!doctype html><html><head><title>Map</title></head><body><h1>Map</h1></body></html>"
+
+    history_file.write_text("not json", encoding="utf-8")
+    assert load_page_history(history_file) == {}
+
+    entry = record_page_publish(config, "U12345", "market-map.html", "U12345-market-map.html", html, "make a map")
+    history = load_page_history(history_file)
+
+    assert entry["current_version"] == 1
+    assert history["U12345"]["last_stored_name"] == "U12345-market-map.html"
+    assert history["U12345"]["pages"]["U12345-market-map.html"]["requested_filename"] == "market-map.html"
+    assert app.Path(entry["versions"][0]["path"]).exists()
+    assert resolve_page_entry(config, "U12345", "market-map.html")[0] == "U12345-market-map.html"
+    assert resolve_page_entry(config, "U12345", "U12345-market-map.html")[0] == "U12345-market-map.html"
+
+
+def test_page_versions_snapshot_and_rollback(tmp_path):
+    app = _load_app_module()
+    record_page_publish = _get_helper(app, "record_page_publish")
+    rollback_published_page = _get_helper(app, "rollback_published_page")
+    format_recent_pages_response = _get_helper(app, "format_recent_pages_response")
+    format_page_history_response = _get_helper(app, "format_page_history_response")
+    sites_dir = tmp_path / "sites"
+    config = _test_config(
+        app,
+        history_file=tmp_path / "history.json",
+        versions_dir=tmp_path / "versions",
+        sites_dir=sites_dir,
+    )
+    html_v1 = "<!doctype html><html><head><title>Map</title></head><body><h1>One</h1></body></html>"
+    html_v2 = "<!doctype html><html><head><title>Map</title></head><body><h1>Two</h1></body></html>"
+    live_path = sites_dir / "U12345-market-map.html"
+
+    live_path.parent.mkdir(parents=True)
+    live_path.write_text(html_v1, encoding="utf-8")
+    record_page_publish(config, "U12345", "market-map.html", "U12345-market-map.html", html_v1, "make a map")
+    live_path.write_text(html_v2, encoding="utf-8")
+    entry = record_page_publish(
+        config,
+        "U12345",
+        "market-map.html",
+        "U12345-market-map.html",
+        html_v2,
+        "add detail",
+        publish_kind="revision",
+    )
+
+    assert entry["current_version"] == 2
+    assert "market-map.html" in format_recent_pages_response(config, "U12345")
+
+    stored_name, rolled_back = rollback_published_page(config, "U12345")
+
+    assert stored_name == "U12345-market-map.html"
+    assert rolled_back["current_version"] == 1
+    assert live_path.read_text(encoding="utf-8") == html_v1
+    page_history = format_page_history_response(config, "U12345", "market-map.html")
+    assert "v1 current" in page_history
+    assert "v2" in page_history
+
+
 def test_build_prompt_from_clarification_combines_original_and_answer():
     app = _load_app_module()
     build_prompt_from_clarification = _get_helper(app, "build_prompt_from_clarification")
@@ -639,6 +757,61 @@ def test_build_prompt_from_clarification_combines_original_and_answer():
     assert filename == "market-map.html"
     assert "make me a market map" in prompt
     assert "enterprise AI for buyers" in prompt
+
+
+def test_build_revision_prompt_includes_context_and_truncates_html():
+    app = _load_app_module()
+    build_revision_prompt = _get_helper(app, "build_revision_prompt")
+    current_html = "<!doctype html><html><body>" + ("x" * (app.MAX_REVISION_HTML_CHARS + 100)) + "</body></html>"
+
+    prompt = build_revision_prompt(
+        {
+            "requested_filename": "market-map.html",
+            "original_prompt": "make a market map",
+            "last_prompt": "add funding stages",
+            "source_filenames": ["companies.csv"],
+        },
+        "make it more executive",
+        current_html,
+    )
+
+    assert "Requested filename: market-map.html" in prompt
+    assert "make a market map" in prompt
+    assert "add funding stages" in prompt
+    assert "make it more executive" in prompt
+    assert "companies.csv" in prompt
+    assert f"[Truncated after {app.MAX_REVISION_HTML_CHARS} characters.]" in prompt
+
+
+def test_revise_published_page_keeps_url_and_increments_version(tmp_path):
+    app = _load_app_module()
+    record_page_publish = _get_helper(app, "record_page_publish")
+    revise_published_page = _get_helper(app, "revise_published_page")
+    sites_dir = tmp_path / "sites"
+    config = _test_config(
+        app,
+        history_file=tmp_path / "history.json",
+        versions_dir=tmp_path / "versions",
+        sites_dir=sites_dir,
+        web_search_enabled=False,
+    )
+    stored_name = "U12345-market-map.html"
+    original_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Old</h1></body></html>"
+    revised_html = "<!doctype html><html><head><title>Map</title></head><body><h1>New</h1></body></html>"
+    live_path = sites_dir / stored_name
+    live_path.parent.mkdir(parents=True)
+    live_path.write_text(original_html, encoding="utf-8")
+    record_page_publish(config, "U12345", "market-map.html", stored_name, original_html, "make a map")
+
+    fake_anthropic = _SequenceAnthropic([revised_html])
+    entry = revise_published_page(fake_anthropic, config, "U12345", "market-map.html", "make it cleaner")
+
+    assert entry["current_version"] == 2
+    assert live_path.read_text(encoding="utf-8") == revised_html
+    assert app.publish_url(config, stored_name) == "https://example.ts.net/U12345-market-map.html"
+    sent_prompt = fake_anthropic.requests[0]["messages"][0]["content"]
+    assert "make it cleaner" in sent_prompt
+    assert "Current live HTML" in sent_prompt
 
 
 def test_generate_html_returns_valid_first_response_without_retry():
