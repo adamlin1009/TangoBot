@@ -102,7 +102,7 @@ MAX_TOTAL_SOURCE_CHARS = 20000
 MAX_SLACK_MESSAGE_CHARS = 3500
 ROUTER_MAX_TOKENS = 400
 CHAT_MAX_TOKENS = 1200
-GENERATION_MAX_TOKENS = 4096
+GENERATION_MAX_TOKENS = 8192
 HELP_ALIASES = {
     "help",
     "guide",
@@ -1089,8 +1089,20 @@ def chat_with_claude(anthropic: Any, config: AppConfig, prompt: str) -> str:
 HTML_REPAIR_PROMPT = (
     "Your previous response could not be published because it was not a complete raw HTML document. "
     "Return a complete, self-contained HTML document now. The first bytes must be <!doctype html>. "
+    "Keep the page compact enough to finish within the output budget, and close both </body> and </html>. "
     "Do not include explanations, progress notes, Markdown fences, or any text outside the HTML document."
 )
+
+
+def html_repair_prompt(first_error: ValueError, response: Any) -> str:
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        return (
+            f"{HTML_REPAIR_PROMPT}\n\n"
+            "The previous response hit the output token limit before completion. "
+            "Generate a shorter version with fewer sections, smaller datasets, and less inline JavaScript.\n\n"
+            f"Validation error: {first_error}"
+        )
+    return f"{HTML_REPAIR_PROMPT}\n\nValidation error: {first_error}"
 
 
 def generate_html(anthropic: Any, config: AppConfig, prompt: str, filename: str | None = None) -> str:
@@ -1119,7 +1131,7 @@ def generate_html(anthropic: Any, config: AppConfig, prompt: str, filename: str 
         request["messages"] = [
             {
                 "role": "user",
-                "content": f"{generation_prompt}\n\n{HTML_REPAIR_PROMPT}\n\nValidation error: {first_error}",
+                "content": f"{generation_prompt}\n\n{html_repair_prompt(first_error, response)}",
             }
         ]
 
@@ -1131,6 +1143,11 @@ def generate_html(anthropic: Any, config: AppConfig, prompt: str, filename: str 
     try:
         html = extract_html_document(extract_text_content(retry_response.content))
     except ValueError as retry_error:
+        if getattr(retry_response, "stop_reason", None) == "max_tokens":
+            raise RuntimeError(
+                "Anthropic hit the output token limit before closing the HTML document. "
+                "Try a narrower request or ask for a simpler page."
+            ) from retry_error
         raise RuntimeError(f"Anthropic returned invalid HTML after retry: {retry_error}") from retry_error
 
     sources = merge_sources(first_sources, extract_cited_sources(retry_response.content))

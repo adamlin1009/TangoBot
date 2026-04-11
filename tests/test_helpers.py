@@ -65,6 +65,22 @@ class _SequenceAnthropic:
         return SimpleNamespace(content=content, stop_reason="end_turn")
 
 
+class _StopReasonAnthropic:
+    def __init__(self, responses):
+        self.messages = self
+        self.responses = list(responses)
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        index = min(len(self.requests) - 1, len(self.responses) - 1)
+        text, stop_reason = self.responses[index]
+        return SimpleNamespace(
+            content=[{"type": "text", "text": text}],
+            stop_reason=stop_reason,
+        )
+
+
 def test_parse_help_command():
     app = _load_app_module()
     parse_command = _get_helper(
@@ -637,6 +653,17 @@ def test_generate_html_returns_valid_first_response_without_retry():
     assert len(fake_anthropic.requests) == 1
 
 
+def test_generate_html_uses_larger_output_budget():
+    app = _load_app_module()
+    generate_html = _get_helper(app, "generate_html")
+    valid_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Market Map</h1></body></html>"
+    fake_anthropic = _SequenceAnthropic([valid_html])
+
+    generate_html(fake_anthropic, _test_config(app), "enterprise AI landscape", "market-map.html")
+
+    assert fake_anthropic.requests[0]["max_tokens"] >= 8192
+
+
 def test_generate_html_does_not_send_web_search_tools_when_disabled():
     app = _load_app_module()
     generate_html = _get_helper(app, "generate_html")
@@ -693,6 +720,42 @@ def test_generate_html_retries_once_after_invalid_response():
     assert len(fake_anthropic.requests) == 2
     assert "Validation error" in fake_anthropic.requests[1]["messages"][-1]["content"]
     assert all(message["role"] != "assistant" for message in fake_anthropic.requests[1]["messages"])
+
+
+def test_generate_html_repair_compacts_after_output_token_limit():
+    app = _load_app_module()
+    generate_html = _get_helper(app, "generate_html")
+    incomplete_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Market Map</h1>"
+    valid_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Compact Map</h1></body></html>"
+    fake_anthropic = _StopReasonAnthropic(
+        [
+            (incomplete_html, "max_tokens"),
+            (valid_html, "end_turn"),
+        ]
+    )
+
+    html = generate_html(fake_anthropic, _test_config(app), "enterprise AI landscape", "market-map.html")
+
+    assert html == valid_html
+    retry_prompt = fake_anthropic.requests[1]["messages"][-1]["content"]
+    assert "output token limit" in retry_prompt
+    assert "shorter version" in retry_prompt
+    assert all(message["role"] != "assistant" for message in fake_anthropic.requests[1]["messages"])
+
+
+def test_generate_html_reports_output_token_limit_after_retry():
+    app = _load_app_module()
+    generate_html = _get_helper(app, "generate_html")
+    incomplete_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Market Map</h1>"
+    fake_anthropic = _StopReasonAnthropic(
+        [
+            (incomplete_html, "max_tokens"),
+            (incomplete_html, "max_tokens"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="output token limit"):
+        generate_html(fake_anthropic, _test_config(app), "enterprise AI landscape", "market-map.html")
 
 
 def test_generate_html_invalid_retry_raises_runtime_error():
