@@ -34,6 +34,7 @@ from generation import (
     chat_with_claude,
     generate_html,
     generation_failure_message,
+    revision_failure_message,
     revise_published_page,
     wrap_jsx_as_html,
 )
@@ -338,7 +339,7 @@ def create_slack_app(config: AppConfig) -> Any:
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to revise page")
-            updater.flush(f"Revision failed: {exc}")
+            updater.flush(revision_failure_message(exc))
             return
 
         stored_name = str(entry.get("stored_name"))

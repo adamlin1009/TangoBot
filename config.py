@@ -8,14 +8,18 @@ DEFAULT_HISTORY_FILE = Path.home() / ".tangobot" / "page_history.json"
 DEFAULT_VERSIONS_DIR = Path.home() / ".tangobot" / "page_versions"
 MAX_ROUTER_INPUT_CHARS = 3000
 MAX_MODEL_INPUT_CHARS = 12000
-MAX_REVISION_HTML_CHARS = 8000
+MAX_REVISION_HTML_CHARS = 16000
 MAX_REVISION_CONTEXT_CHARS = 2000
+MAX_REVISION_PATCH_HTML_CHARS = 60000
 MAX_SOURCE_FILE_CHARS = 12000
 MAX_TOTAL_SOURCE_CHARS = 20000
 MAX_SLACK_MESSAGE_CHARS = 3500
 ROUTER_MAX_TOKENS = 400
 CHAT_MAX_TOKENS = 1200
-GENERATION_MAX_TOKENS = 8192
+REVISION_PATCH_MAX_TOKENS = 4096
+GENERATION_MAX_TOKENS = 32768
+MIN_GENERATION_MAX_TOKENS = 8192
+MAX_GENERATION_MAX_TOKENS = 64000
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,7 @@ class AppConfig:
     state_file: Path = DEFAULT_STATE_FILE
     history_file: Path = DEFAULT_HISTORY_FILE
     versions_dir: Path = DEFAULT_VERSIONS_DIR
+    generation_max_tokens: int = GENERATION_MAX_TOKENS
 
 
 def require_env(name: str, default: str | None = None) -> str:
@@ -57,6 +62,10 @@ def env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer.") from exc
+
+
+def env_int_clamped(name: str, default: int, minimum: int, maximum: int) -> int:
+    return max(min(env_int(name, default), maximum), minimum)
 
 
 def load_env_file(path: Path) -> None:
@@ -103,4 +112,10 @@ def load_config() -> AppConfig:
         state_file=state_file,
         history_file=history_file,
         versions_dir=versions_dir,
+        generation_max_tokens=env_int_clamped(
+            "ANTHROPIC_GENERATION_MAX_TOKENS",
+            GENERATION_MAX_TOKENS,
+            MIN_GENERATION_MAX_TOKENS,
+            MAX_GENERATION_MAX_TOKENS,
+        ),
     )

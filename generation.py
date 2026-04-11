@@ -1,4 +1,5 @@
 import html as html_escape
+import json
 import random
 import re
 import time
@@ -12,9 +13,11 @@ from config import (
     MAX_MODEL_INPUT_CHARS,
     MAX_REVISION_CONTEXT_CHARS,
     MAX_REVISION_HTML_CHARS,
+    MAX_REVISION_PATCH_HTML_CHARS,
     MAX_SLACK_MESSAGE_CHARS,
     MAX_SOURCE_FILE_CHARS,
     MAX_TOTAL_SOURCE_CHARS,
+    REVISION_PATCH_MAX_TOKENS,
 )
 
 
@@ -64,6 +67,34 @@ HTML_REPAIR_PROMPT = (
     "Do not include explanations, progress notes, Markdown fences, or any text outside the HTML document."
 )
 
+HTML_CONTINUATION_PROMPT = (
+    "Continue the same HTML document from the exact next byte. "
+    "Do not repeat any previous HTML, do not add explanations, and continue until the document is complete with </html>."
+)
+
+REVISION_PATCH_SYSTEM_PROMPT = (
+    "Revise the supplied HTML by returning JSON operations only. "
+    "Do not return HTML, Markdown, commentary, or code fences. "
+    "Use exact substrings copied from the current HTML so the caller can apply the patch safely. "
+    "Return this schema: "
+    '{"operations":[{"op":"replace","old":"exact existing string","new":"replacement string"},'
+    '{"op":"insert_before","anchor":"exact existing string","content":"inserted string"},'
+    '{"op":"insert_after","anchor":"exact existing string","content":"inserted string"}],'
+    '"fallback":null}. '
+    "Use the smallest operation set that satisfies the revision. "
+    "If an exact safe patch is not possible, return {\"operations\":[],\"fallback\":\"reason\"}."
+)
+
+BROAD_REVISION_PATTERN = re.compile(
+    r"\b("
+    r"redesign|rebuild|recreate|rewrite|start over|from scratch|entire page|whole page|"
+    r"completely|different page|new page|turn (it|this|that|the page) into|convert (it|this|that|the page) into"
+    r")\b",
+    re.IGNORECASE,
+)
+
+MAX_HTML_CONTINUATIONS = 2
+
 RATE_LIMIT_ERROR_PATTERN = re.compile(
     r"\b(429|rate[_ -]?limit|input tokens per minute|tokens per minute|requests per minute)\b",
     re.IGNORECASE,
@@ -109,6 +140,15 @@ def extract_text_content(blocks: list[Any]) -> str:
         if block_type == "text":
             text_parts.append(get_block_value(block, "text", ""))
     return "\n".join(text_parts).strip()
+
+
+def extract_raw_text_content(blocks: list[Any]) -> str:
+    text_parts: list[str] = []
+    for block in blocks:
+        block_type = get_block_value(block, "type")
+        if block_type == "text":
+            text_parts.append(get_block_value(block, "text", ""))
+    return "\n".join(text_parts)
 
 
 def extract_web_search_errors(blocks: list[Any]) -> list[str]:
@@ -299,6 +339,116 @@ def build_revision_prompt(entry: dict[str, Any], instructions: str, current_html
     )
 
 
+def build_revision_patch_prompt(entry: dict[str, Any], instructions: str, current_html: str) -> str:
+    requested_filename = str(entry.get("requested_filename") or entry.get("stored_name") or "page.html")
+    original_prompt = truncate_text(str(entry.get("original_prompt") or ""), MAX_REVISION_CONTEXT_CHARS)
+    last_prompt = truncate_text(str(entry.get("last_prompt") or ""), MAX_REVISION_CONTEXT_CHARS)
+    bounded_instructions = truncate_text(instructions.strip(), MAX_REVISION_CONTEXT_CHARS)
+    bounded_html = truncate_text(current_html, MAX_REVISION_PATCH_HTML_CHARS)
+    source_filenames = entry.get("source_filenames") if isinstance(entry.get("source_filenames"), list) else []
+    source_line = f"Source files used previously: {', '.join(map(str, source_filenames))}\n" if source_filenames else ""
+
+    return (
+        "Create a safe patch for this published HTML page.\n\n"
+        f"Requested filename: {requested_filename}\n"
+        f"{source_line}"
+        "Original request:\n"
+        f"{original_prompt or '(not recorded)'}\n\n"
+        "Most recent request or revision:\n"
+        f"{last_prompt or '(not recorded)'}\n\n"
+        "Revision instructions:\n"
+        f"{bounded_instructions}\n\n"
+        "Current live HTML:\n"
+        f"{bounded_html}\n\n"
+        "Return JSON operations only. Prefer one or a few exact replacements or insertions."
+    )
+
+
+def is_broad_revision_request(instructions: str) -> bool:
+    return bool(BROAD_REVISION_PATTERN.search(instructions.strip()))
+
+
+def extract_json_payload(text: str) -> dict[str, Any]:
+    stripped = strip_markdown_fences(text).strip()
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("Patch response was not JSON.") from None
+        try:
+            payload = json.loads(stripped[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise ValueError("Patch response was not valid JSON.") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Patch response was not a JSON object.")
+    return payload
+
+
+def _string_field(operation: dict[str, Any], field: str) -> str:
+    value = operation.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Patch operation missing string field: {field}.")
+    return value
+
+
+def _single_match_index(html: str, needle: str) -> int:
+    count = html.count(needle)
+    if count != 1:
+        raise ValueError(f"Patch anchor matched {count} times instead of exactly once.")
+    return html.find(needle)
+
+
+def apply_revision_operations(current_html: str, operations: list[dict[str, Any]]) -> str:
+    if not operations:
+        raise ValueError("Patch response did not include any operations.")
+
+    html = current_html
+    for operation in operations:
+        if not isinstance(operation, dict):
+            raise ValueError("Patch operation was not an object.")
+
+        op = str(operation.get("op") or "")
+        if op == "replace":
+            old = _string_field(operation, "old")
+            new = operation.get("new")
+            if not isinstance(new, str):
+                raise ValueError("Patch replace operation missing string field: new.")
+            index = _single_match_index(html, old)
+            html = f"{html[:index]}{new}{html[index + len(old):]}"
+            continue
+
+        if op == "insert_before":
+            anchor = _string_field(operation, "anchor")
+            content = _string_field(operation, "content")
+            index = _single_match_index(html, anchor)
+            html = f"{html[:index]}{content}{html[index:]}"
+            continue
+
+        if op == "insert_after":
+            anchor = _string_field(operation, "anchor")
+            content = _string_field(operation, "content")
+            index = _single_match_index(html, anchor) + len(anchor)
+            html = f"{html[:index]}{content}{html[index:]}"
+            continue
+
+        raise ValueError(f"Unsupported patch operation: {op or '(missing)'}.")
+
+    return extract_html_document(html)
+
+
+def parse_revision_patch(text: str) -> list[dict[str, Any]]:
+    payload = extract_json_payload(text)
+    operations = payload.get("operations")
+    if not isinstance(operations, list):
+        raise ValueError("Patch response missing operations list.")
+    if not operations and payload.get("fallback"):
+        raise ValueError(str(payload["fallback"]))
+    return operations
+
+
 def web_search_tools(config: AppConfig) -> list[dict[str, Any]]:
     if not config.web_search_enabled:
         return []
@@ -349,6 +499,17 @@ def chat_failure_message(exc: BaseException) -> str:
     return f"Chat failed: {exc}"
 
 
+def revision_failure_message(exc: BaseException) -> str:
+    if is_rate_limit_error(exc):
+        return "Revision hit the model rate limit. Wait about a minute and try again with a narrower change."
+    if "too large to complete" in str(exc) or "output token limit" in str(exc):
+        return (
+            "Revision could not fit into the model output budget after automatic continuation. "
+            "Try a narrower change, or ask for a simpler compact version of the page."
+        )
+    return f"Revision failed: {exc}"
+
+
 def html_repair_prompt(first_error: ValueError, response: Any) -> str:
     if getattr(response, "stop_reason", None) == "max_tokens":
         return (
@@ -358,6 +519,25 @@ def html_repair_prompt(first_error: ValueError, response: Any) -> str:
             f"Validation error: {first_error}"
         )
     return f"{HTML_REPAIR_PROMPT}\n\nValidation error: {first_error}"
+
+
+def output_token_limit_message() -> str:
+    return (
+        "The page is too large to complete in one model response even after automatic continuation. "
+        "I tried a compact repair pass, but Anthropic still stopped before the HTML could be closed."
+    )
+
+
+def extract_html_response_text(responses: list[Any]) -> str:
+    return "".join(extract_raw_text_content(response.content) for response in responses)
+
+
+def extract_html_response_sources(responses: list[Any]) -> list[dict[str, str]]:
+    return merge_sources(*(extract_cited_sources(response.content) for response in responses))
+
+
+def response_has_web_search_errors(response: Any) -> list[str]:
+    return extract_web_search_errors(response.content)
 
 
 def _with_rate_limit_retry(fn: Callable[[], Any], *, max_attempts: int) -> Any:
@@ -493,7 +673,7 @@ def generate_html(
     messages: list[dict[str, Any]] = [{"role": "user", "content": generation_prompt}]
     request: dict[str, Any] = {
         "model": config.anthropic_model,
-        "max_tokens": GENERATION_MAX_TOKENS,
+        "max_tokens": config.generation_max_tokens,
         "system": generation_system_prompt(config),
         "messages": messages,
     }
@@ -511,20 +691,36 @@ def generate_html(
 
         return stream_anthropic_message(anthropic, request, on_progress=forward)
 
+    def collect_complete_response(initial_response: Any, phase: str) -> tuple[str, list[dict[str, str]], Any]:
+        responses = [initial_response]
+        response = initial_response
+        continuation_count = 0
+        while getattr(response, "stop_reason", None) == "max_tokens" and continuation_count < MAX_HTML_CONTINUATIONS:
+            continuation_count += 1
+            request["messages"].append({"role": "assistant", "content": response.content})
+            request["messages"].append({"role": "user", "content": HTML_CONTINUATION_PROMPT})
+            response = call_model(phase)
+            search_errors = response_has_web_search_errors(response)
+            if search_errors:
+                raise RuntimeError(f"Anthropic web search failed: {', '.join(search_errors)}")
+            responses.append(response)
+
+        return extract_html_response_text(responses), extract_html_response_sources(responses), response
+
     response = call_model("Generating")
     search_errors = extract_web_search_errors(response.content)
     if search_errors:
         raise RuntimeError(f"Anthropic web search failed: {', '.join(search_errors)}")
 
-    first_sources = extract_cited_sources(response.content)
+    first_text, first_sources, first_last_response = collect_complete_response(response, "Continuing")
     try:
-        html = extract_html_document(extract_text_content(response.content))
+        html = extract_html_document(first_text)
         return append_sources_section(html, first_sources)
     except ValueError as first_error:
         request["messages"] = [
             {
                 "role": "user",
-                "content": f"{generation_prompt}\n\n{html_repair_prompt(first_error, response)}",
+                "content": f"{generation_prompt}\n\n{html_repair_prompt(first_error, first_last_response)}",
             }
         ]
 
@@ -533,18 +729,48 @@ def generate_html(
     if retry_search_errors:
         raise RuntimeError(f"Anthropic web search failed: {', '.join(retry_search_errors)}")
 
+    retry_text, retry_sources, retry_last_response = collect_complete_response(retry_response, "Continuing repair")
     try:
-        html = extract_html_document(extract_text_content(retry_response.content))
+        html = extract_html_document(retry_text)
     except ValueError as retry_error:
-        if getattr(retry_response, "stop_reason", None) == "max_tokens":
-            raise RuntimeError(
-                "Anthropic hit the output token limit before closing the HTML document. "
-                "Try a narrower request or ask for a simpler page."
-            ) from retry_error
+        if getattr(retry_last_response, "stop_reason", None) == "max_tokens":
+            raise RuntimeError(output_token_limit_message()) from retry_error
         raise RuntimeError(f"Anthropic returned invalid HTML after retry: {retry_error}") from retry_error
 
-    sources = merge_sources(first_sources, extract_cited_sources(retry_response.content))
+    sources = merge_sources(first_sources, retry_sources)
     return append_sources_section(html, sources)
+
+
+def revise_html_with_patch(
+    anthropic: Any,
+    config: AppConfig,
+    entry: dict[str, Any],
+    instructions: str,
+    current_html: str,
+    *,
+    on_progress: Callable[[str], None] | None = None,
+) -> str:
+    if on_progress is not None:
+        on_progress("Preparing a targeted patch...")
+
+    request: dict[str, Any] = {
+        "model": config.anthropic_model,
+        "max_tokens": REVISION_PATCH_MAX_TOKENS,
+        "system": REVISION_PATCH_SYSTEM_PROMPT,
+        "messages": [
+            {
+                "role": "user",
+                "content": build_revision_patch_prompt(entry, instructions, current_html),
+            }
+        ],
+    }
+    response = create_anthropic_message(anthropic, request)
+    text = extract_text_content(response.content)
+    if not text:
+        raise ValueError("Patch response was empty.")
+
+    operations = parse_revision_patch(text)
+    return apply_revision_operations(current_html, operations)
 
 
 def revise_published_page(
@@ -574,8 +800,23 @@ def revise_published_page(
 
     current_html = live_path.read_text(encoding="utf-8")
     requested_filename = str(entry.get("requested_filename") or stored_name)
-    revision_prompt = build_revision_prompt(entry, instructions, current_html)
-    html = generate_html(anthropic, config, revision_prompt, requested_filename, on_progress=on_progress)
+    if is_broad_revision_request(instructions):
+        revision_prompt = build_revision_prompt(entry, instructions, current_html)
+        html = generate_html(anthropic, config, revision_prompt, requested_filename, on_progress=on_progress)
+    else:
+        try:
+            html = revise_html_with_patch(
+                anthropic,
+                config,
+                entry,
+                instructions,
+                current_html,
+                on_progress=on_progress,
+            )
+        except ValueError:
+            revision_prompt = build_revision_prompt(entry, instructions, current_html)
+            html = generate_html(anthropic, config, revision_prompt, requested_filename, on_progress=on_progress)
+
     write_text_file(live_path, html)
     return record_page_publish(
         config,
