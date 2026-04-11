@@ -37,7 +37,7 @@ All inbound traffic is Slack DMs handled by the `@app.event("message")` callback
 
 ### Clarification state machine
 
-Thin requests stash pending state via `set_pending_clarification` / `get_pending_clarification` / `clear_pending_clarification` (`storage.py`), keyed by Slack user ID in `TANGOBOT_STATE_FILE`. Each call wraps the full read-modify-write in `file_lock(config.state_file)` (POSIX `fcntl.flock` on a sidecar `.lock` file) to serialize concurrent DMs from the same user. On the user's next DM, `build_prompt_from_clarification` merges the original prompt with the answer and generation proceeds. `cancel` clears pending state.
+Thin requests stash pending state via `set_pending_clarification` / `get_pending_clarification` / `clear_pending_clarification` (`storage.py`), keyed by Slack user ID in `TANGOBOT_STATE_FILE`. Each call wraps the full read-modify-write in `file_lock(config.state_file)`, which uses `fcntl.flock` on POSIX and `msvcrt.locking` on Windows against a sidecar `.lock` file to serialize concurrent DMs from the same user. On the user's next DM, `build_prompt_from_clarification` merges the original prompt with the answer and generation proceeds. `cancel` clears pending state.
 
 ### Streaming and the Anthropic wrapper
 
