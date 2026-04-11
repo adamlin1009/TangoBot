@@ -6,6 +6,7 @@ Minimal Slack DM bot for publishing single-file HTML pages to a tailnet via Tail
 
 - Accepts Slack DMs only.
 - Supports natural-language generation requests, `generate <filename>.html <prompt>`, and `help`.
+- Asks one clarification question for thin page requests before generating.
 - Accepts `.html` file uploads and saves them directly.
 - Accepts `.jsx` React component uploads and publishes both the source and a runnable `.html` page.
 - Accepts `.txt`, `.md`, `.csv`, and `.json` uploads as source material for generation.
@@ -59,6 +60,8 @@ Copy `.env.example` to `.env` and fill in the values. `TAILSCALE_BASE_URL` is op
 
 `ANTHROPIC_WEB_SEARCH=1` is enabled by default so Claude can look up current market data, companies, pricing, and other fresh facts. Web search uses Anthropic's paid search tool in addition to normal token usage. Set `ANTHROPIC_WEB_SEARCH=0` to disable it.
 
+`TANGOBOT_STATE_FILE` is optional. It defaults to `~/.tangobot/pending_clarifications.json` and stores pending one-question clarification flows across bot restarts.
+
 The default model is `claude-sonnet-4-6`. For deeper reasoning at higher cost, set `ANTHROPIC_MODEL=claude-opus-4-6`.
 
 On Windows, if you already configured Tailscale Serve once from an administrator shell, set `SKIP_TAILSCALE_SERVE=1` so normal bot restarts do not need administrator permissions.
@@ -86,7 +89,7 @@ make me a marketplace map for enterprise AI
 create market-map.html for the enterprise AI landscape
 ```
 
-For natural-language requests, the bot picks a readable filename and asks Claude to infer a complete page structure with illustrative content. If you provide only a filename, the bot infers the page idea from the filename. You can also paste source notes, lists, or URLs directly into the message.
+For natural-language requests, the bot picks a readable filename and asks Claude to infer a complete page structure with illustrative content. If a request is too thin, such as only a filename or an artifact type without a subject, the bot asks one clarification question and uses the next DM reply to generate the page. Reply `cancel` to clear a pending clarification. You can also paste source notes, lists, or URLs directly into the message.
 
 If a user uploads an `.html` file in a DM, the bot saves it and returns the tailnet URL. If a user uploads a `.jsx` file, it must be one self-contained React component using global `React`; the bot saves the `.jsx` source and publishes a wrapped `.html` page that loads React, ReactDOM, and Babel from CDNs. If a user uploads `.txt`, `.md`, `.csv`, or `.json` files with a request, the bot uses those files as source material for the generated page.
 

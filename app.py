@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ HELP_TEXT = (
     "If current facts matter, I can use Anthropic web search when it is enabled.\n\n"
     "*Generate and host a page*\n"
     "Describe the page you want and I will create a self-contained HTML page, save it, and reply with a Tailscale URL.\n"
+    "If the request is too thin, I will ask one clarification question first.\n"
     "Examples:\n"
     "- `make me a marketplace map for enterprise AI`\n"
     "- `build a pricing dashboard for our Q2 packaging options`\n"
@@ -40,7 +42,9 @@ HELP_TEXT = (
 
 GENERATION_SYSTEM_PROMPT = (
     "Generate a complete, polished, self-contained HTML document from the user's request. "
-    "If the request is brief, infer a useful structure and include realistic illustrative content. "
+    "The first bytes of your response must be <!doctype html>. "
+    "Return only raw HTML; never include progress narration, research narration, explanations, or Markdown fences. "
+    "If the request is brief but specific enough, infer a useful structure and include realistic illustrative content. "
     "When current facts, companies, funding, market landscapes, pricing, news, or dates matter, use web search. "
     "Treat user-provided notes, pasted lists, uploaded files, and URLs as primary source material. "
     "Use web search to fill gaps, verify current facts, and add citations when helpful. "
@@ -49,8 +53,6 @@ GENERATION_SYSTEM_PROMPT = (
     "Avoid empty placeholders such as TODO, lorem ipsum, or coming soon. "
     "When using web information, include a concise Sources section with clickable links. "
     "Make the page responsive and immediately useful. "
-    "Return only raw HTML. "
-    "Do not wrap the response in Markdown fences. "
     "Inline all CSS and JavaScript."
 )
 
@@ -62,11 +64,12 @@ CHAT_SYSTEM_PROMPT = (
 )
 
 ROUTER_SYSTEM_PROMPT = (
-    "Route this Slack DM for a bot that can either chat normally or generate and host a single-file HTML page. "
+    "Route this Slack DM for a bot that can chat normally, ask one clarification question, or generate and host a single-file HTML page. "
     "Return only JSON with this schema: "
-    '{"action":"chat|generate","filename":"optional-name.html or null","prompt":"the complete prompt to answer or generate from"}. '
+    '{"action":"chat|generate|clarify","filename":"optional-name.html or null","prompt":"the complete prompt to answer or generate from","question":"optional clarification question or null"}. '
     "Use generate when the user asks to make, create, build, design, draft, visualize, map, chart, dashboard, report, "
     "landing page, web page, HTML page, tool, demo, or other hosted artifact. "
+    "Use clarify when the user wants an artifact but the subject, audience, data, or desired outcome is too underspecified to generate the right thing. "
     "Use chat for questions, setup help, explanations, and ordinary conversation. "
     "If generating and no filename is provided, set filename to null. "
     "If the user provides a filename ending in .html, preserve it."
@@ -74,6 +77,7 @@ ROUTER_SYSTEM_PROMPT = (
 
 SOURCE_FILE_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".json"}
 ARTIFACT_FILE_SUFFIXES = {".html", ".jsx"}
+DEFAULT_STATE_FILE = Path.home() / ".tangobot" / "pending_clarifications.json"
 MAX_SOURCE_FILE_CHARS = 20000
 MAX_TOTAL_SOURCE_CHARS = 60000
 MAX_SLACK_MESSAGE_CHARS = 3500
@@ -89,6 +93,54 @@ HELP_ALIASES = {
     "what can you do",
     "what can you do?",
 }
+CANCEL_ALIASES = {"cancel", "nevermind", "never mind", "stop"}
+GENERATION_ARTIFACT_TERMS = {
+    "app",
+    "application",
+    "artifact",
+    "brief",
+    "chart",
+    "dashboard",
+    "demo",
+    "document",
+    "html",
+    "landing",
+    "landscape",
+    "map",
+    "market",
+    "matrix",
+    "page",
+    "plan",
+    "report",
+    "site",
+    "tool",
+    "visualization",
+    "website",
+    "ecosystem",
+}
+GENERATION_FILLER_TERMS = {
+    "all",
+    "anything",
+    "comprehensive",
+    "current",
+    "data",
+    "everything",
+    "good",
+    "great",
+    "info",
+    "information",
+    "latest",
+    "nice",
+    "polished",
+    "relevant",
+    "single",
+    "stuff",
+    "thing",
+    "things",
+    "use",
+    "web",
+    "search",
+}
 
 
 @dataclass(frozen=True)
@@ -102,6 +154,7 @@ class AppConfig:
     tailscale_base_url: str
     web_search_enabled: bool
     web_search_max_uses: int
+    state_file: Path = DEFAULT_STATE_FILE
 
 
 @dataclass(frozen=True)
@@ -109,6 +162,7 @@ class Command:
     kind: str
     filename: str | None = None
     prompt: str | None = None
+    question: str | None = None
 
 
 def require_env(name: str, default: str | None = None) -> str:
@@ -204,6 +258,7 @@ FILENAME_STOPWORDS = {
     "to",
     "with",
 }
+GENERATION_STOPWORDS = FILENAME_STOPWORDS | GENERATION_ARTIFACT_TERMS | GENERATION_FILLER_TERMS
 
 
 def filename_from_prompt(prompt: str) -> str:
@@ -216,9 +271,104 @@ def filename_from_prompt(prompt: str) -> str:
 
 
 def prompt_from_filename(filename: str) -> str:
+    title = title_from_filename(filename)
+    return f"Create a complete, useful single-page artifact inferred from the filename: {title}."
+
+
+def title_from_filename(filename: str | None) -> str:
+    if not filename:
+        return "page"
     stem = Path(filename).stem
-    title = re.sub(r"[^A-Za-z0-9]+", " ", stem).strip() or "page"
-    return f"Create a polished single-page web page for: {title}."
+    return re.sub(r"[^A-Za-z0-9]+", " ", stem).strip() or "page"
+
+
+def generation_content_terms(text: str) -> list[str]:
+    return [
+        word
+        for word in re.findall(r"[a-z0-9]+", text.lower())
+        if word not in GENERATION_STOPWORDS
+    ]
+
+
+def should_clarify_generation_request(filename: str | None, prompt: str | None) -> bool:
+    prompt_text = (prompt or "").strip()
+    if not prompt_text:
+        return True
+    if filename and prompt_text == prompt_from_filename(filename):
+        return True
+
+    words = re.findall(r"[a-z0-9]+", prompt_text.lower())
+    if not words:
+        return True
+    return not generation_content_terms(prompt_text)
+
+
+def clarification_question_for(filename: str | None, prompt: str | None) -> str:
+    combined = f"{title_from_filename(filename)} {prompt or ''}".lower()
+    if re.search(r"\b(map|landscape|matrix)\b", combined):
+        return "What market, industry, or audience should this map cover?"
+    if re.search(r"\bdashboard\b", combined):
+        return "What data, team, or business area should this dashboard cover?"
+    if re.search(r"\b(chart|visualization)\b", combined):
+        return "What data or topic should this visualization focus on?"
+    if re.search(r"\b(tool|demo|app|application)\b", combined):
+        return "What should this tool help someone do?"
+    if re.search(r"\b(report|brief|plan|document)\b", combined):
+        return "What topic and audience should this page focus on?"
+    return "What topic, audience, or outcome should this page focus on?"
+
+
+def generation_or_clarification_command(
+    filename: str | None,
+    prompt: str | None,
+    *,
+    question: str | None = None,
+) -> Command:
+    if should_clarify_generation_request(filename, prompt):
+        resolved_filename = filename or filename_from_prompt(prompt or "page")
+        resolved_prompt = prompt or prompt_from_filename(resolved_filename)
+        return Command(
+            kind="clarify",
+            filename=resolved_filename,
+            prompt=resolved_prompt,
+            question=question or clarification_question_for(resolved_filename, resolved_prompt),
+        )
+
+    assert prompt is not None
+    return Command(kind="generate", filename=filename or filename_from_prompt(prompt), prompt=prompt)
+
+
+def build_generation_prompt(prompt: str, filename: str | None = None) -> str:
+    title = title_from_filename(filename)
+    filename_line = f"Requested filename: {filename}\n" if filename else ""
+    return (
+        f"{filename_line}"
+        f"User request:\n{prompt}\n\n"
+        "Build the actual requested artifact as a finished single-page HTML document. "
+        "Infer the artifact type, audience, core content, layout, and useful interactions from the request. "
+        "Use the requested filename as intent context, but do not show the filename as a title unless it is natural.\n\n"
+        "If the request is brief, choose practical defaults and make the page immediately useful instead of generic. "
+        "Maps should become structured visual landscapes; dashboards should become data-oriented views; "
+        "tools should be usable on the first screen; reports and plans should be scannable, specific, and organized. "
+        "If current facts, companies, markets, pricing, news, dates, or funding matter, use web search and cite sources.\n\n"
+        f"Working title or inferred topic: {title}."
+    )
+
+
+def build_prompt_from_clarification(pending: dict[str, Any], answer: str) -> tuple[str, str]:
+    filename = str(pending.get("filename") or filename_from_prompt(answer))
+    original_prompt = str(pending.get("prompt") or prompt_from_filename(filename))
+    prompt = (
+        "Original request:\n"
+        f"{original_prompt}\n\n"
+        "Clarification answer:\n"
+        f"{answer.strip()}"
+    )
+    return filename, prompt
+
+
+def is_cancel_text(text: str | None) -> bool:
+    return (text or "").strip().lower() in CANCEL_ALIASES
 
 
 def filename_from_source_files(files: list[dict[str, Any]]) -> str:
@@ -252,11 +402,8 @@ def extract_requested_filename(text: str) -> tuple[str | None, str]:
 def local_generation_hint(text: str) -> Command | None:
     filename, prompt = extract_requested_filename(text)
     if filename:
-        return Command(
-            kind="generate",
-            filename=filename,
-            prompt=prompt if not is_thin_prompt(prompt) else prompt_from_filename(filename),
-        )
+        resolved_prompt = prompt if not is_thin_prompt(prompt) else prompt_from_filename(filename)
+        return generation_or_clarification_command(filename, resolved_prompt)
     return None
 
 
@@ -272,11 +419,8 @@ def parse_command(text: str | None) -> Command | None:
     if match:
         filename = normalize_html_filename(match.group(1))
         prompt = (match.group(2) or "").strip()
-        return Command(
-            kind="generate",
-            filename=filename,
-            prompt=prompt if not is_thin_prompt(prompt) else prompt_from_filename(filename),
-        )
+        resolved_prompt = prompt if not is_thin_prompt(prompt) else prompt_from_filename(filename)
+        return generation_or_clarification_command(filename, resolved_prompt)
 
     hinted_command = local_generation_hint(stripped)
     if hinted_command:
@@ -297,7 +441,7 @@ def looks_like_generation_request(text: str) -> bool:
 
 def fallback_route_message_intent(text: str) -> Command:
     if looks_like_generation_request(text):
-        return Command(kind="generate", filename=filename_from_prompt(text), prompt=text)
+        return generation_or_clarification_command(filename_from_prompt(text), text)
     return Command(kind="chat", prompt=text)
 
 
@@ -321,9 +465,18 @@ def command_from_route_payload(payload: dict[str, Any], original_text: str) -> C
     prompt = str(payload.get("prompt") or original_text).strip()
     filename_value = payload.get("filename")
     filename = normalize_html_filename(str(filename_value)) if filename_value else None
+    question = str(payload.get("question") or "").strip() or None
 
     if action == "generate":
-        return Command(kind="generate", filename=filename or filename_from_prompt(prompt), prompt=prompt)
+        return generation_or_clarification_command(filename or filename_from_prompt(prompt), prompt)
+    if action == "clarify":
+        resolved_filename = filename or filename_from_prompt(prompt)
+        return Command(
+            kind="clarify",
+            filename=resolved_filename,
+            prompt=prompt or prompt_from_filename(resolved_filename),
+            question=question or clarification_question_for(resolved_filename, prompt),
+        )
     if action == "chat":
         return Command(kind="chat", prompt=prompt)
 
@@ -525,6 +678,46 @@ def strip_markdown_fences(text: str) -> str:
     return stripped
 
 
+def extract_html_document(text: str) -> str:
+    stripped = strip_markdown_fences(text)
+    start_match = re.search(r"<!doctype\s+html\b|<html\b", stripped, re.IGNORECASE)
+    if not start_match:
+        raise ValueError("Anthropic did not return an HTML document.")
+
+    candidate = stripped[start_match.start():]
+    end_matches = list(re.finditer(r"</html\s*>", candidate, re.IGNORECASE))
+    if not end_matches:
+        raise ValueError("Anthropic returned incomplete HTML without a closing </html> tag.")
+
+    html = candidate[: end_matches[-1].end()].strip()
+    required_tags = {
+        "html": r"<html\b",
+        "head": r"<head\b",
+        "body": r"<body\b",
+    }
+    missing = [
+        tag
+        for tag, pattern in required_tags.items()
+        if not re.search(pattern, html, re.IGNORECASE)
+    ]
+    if missing:
+        raise ValueError(f"Anthropic returned incomplete HTML missing: {', '.join(missing)}.")
+    return html
+
+
+def merge_sources(*source_groups: list[dict[str, str]]) -> list[dict[str, str]]:
+    merged: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for sources in source_groups:
+        for source in sources:
+            url = source.get("url")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            merged.append(source)
+    return merged
+
+
 def truncate_text(value: str, max_chars: int) -> str:
     if len(value) <= max_chars:
         return value
@@ -558,8 +751,14 @@ def build_prompt_with_sources(prompt: str, source_files: list[dict[str, str]]) -
 
 def command_for_source_generation(text: str | None, source_files: list[dict[str, Any]]) -> Command:
     command = parse_command(text)
-    if command and command.kind != "route":
+    if command and command.kind == "help":
         return command
+    if command and command.kind in {"generate", "clarify"}:
+        return Command(
+            kind="generate",
+            filename=command.filename or filename_from_source_files(source_files),
+            prompt=command.prompt or prompt_from_source_filenames(source_files),
+        )
 
     prompt = command.prompt if command and command.prompt else prompt_from_source_filenames(source_files)
     filename = filename_from_prompt(prompt) if command and command.prompt else filename_from_source_files(source_files)
@@ -568,6 +767,53 @@ def command_for_source_generation(text: str | None, source_files: list[dict[str,
 
 def write_text_file(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
+
+
+def load_pending_clarifications(state_file: Path) -> dict[str, dict[str, Any]]:
+    if not state_file.exists():
+        return {}
+
+    try:
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(user_id): state
+        for user_id, state in payload.items()
+        if isinstance(state, dict)
+    }
+
+
+def save_pending_clarifications(state_file: Path, state: dict[str, dict[str, Any]]) -> None:
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def get_pending_clarification(config: AppConfig, slack_user_id: str) -> dict[str, Any] | None:
+    return load_pending_clarifications(config.state_file).get(slack_user_id)
+
+
+def set_pending_clarification(config: AppConfig, slack_user_id: str, command: Command) -> None:
+    state = load_pending_clarifications(config.state_file)
+    filename = command.filename or filename_from_prompt(command.prompt or "page")
+    prompt = command.prompt or prompt_from_filename(filename)
+    state[slack_user_id] = {
+        "filename": filename,
+        "prompt": prompt,
+        "question": command.question or clarification_question_for(filename, prompt),
+        "created_at": time.time(),
+    }
+    save_pending_clarifications(config.state_file, state)
+
+
+def clear_pending_clarification(config: AppConfig, slack_user_id: str) -> None:
+    state = load_pending_clarifications(config.state_file)
+    if slack_user_id in state:
+        del state[slack_user_id]
+        save_pending_clarifications(config.state_file, state)
 
 
 def run_tailscale_command(config: AppConfig, *args: str) -> subprocess.CompletedProcess[str]:
@@ -597,6 +843,7 @@ def load_config() -> AppConfig:
     load_env_file(Path(".env"))
     sites_dir = Path(os.environ.get("SITES_DIR", Path.home() / "sites")).expanduser().resolve()
     sites_dir.mkdir(parents=True, exist_ok=True)
+    state_file = Path(os.environ.get("TANGOBOT_STATE_FILE", DEFAULT_STATE_FILE)).expanduser().resolve()
 
     tailscale_bin = os.environ.get("TAILSCALE_BIN", "tailscale")
     tailscale_base_url = os.environ.get("TAILSCALE_BASE_URL")
@@ -613,6 +860,7 @@ def load_config() -> AppConfig:
         tailscale_base_url=tailscale_base_url.rstrip("/"),
         web_search_enabled=env_bool("ANTHROPIC_WEB_SEARCH", True),
         web_search_max_uses=max(env_int("ANTHROPIC_WEB_SEARCH_MAX_USES", 5), 1),
+        state_file=state_file,
     )
 
 
@@ -711,11 +959,18 @@ def chat_with_claude(anthropic: Any, config: AppConfig, prompt: str) -> str:
     return truncate_slack_response(append_sources_to_slack_response(text, extract_cited_sources(response.content)))
 
 
-def generate_html(anthropic: Any, config: AppConfig, prompt: str) -> str:
-    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+HTML_REPAIR_PROMPT = (
+    "Your previous response could not be published because it was not a complete raw HTML document. "
+    "Return a complete, self-contained HTML document now. The first bytes must be <!doctype html>. "
+    "Do not include explanations, progress notes, Markdown fences, or any text outside the HTML document."
+)
+
+
+def generate_html(anthropic: Any, config: AppConfig, prompt: str, filename: str | None = None) -> str:
+    messages: list[dict[str, Any]] = [{"role": "user", "content": build_generation_prompt(prompt, filename)}]
     request: dict[str, Any] = {
         "model": config.anthropic_model,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "system": GENERATION_SYSTEM_PROMPT,
         "messages": messages,
     }
@@ -728,10 +983,31 @@ def generate_html(anthropic: Any, config: AppConfig, prompt: str) -> str:
     if search_errors:
         raise RuntimeError(f"Anthropic web search failed: {', '.join(search_errors)}")
 
-    html = strip_markdown_fences(extract_text_content(response.content))
-    if not html:
-        raise RuntimeError("Anthropic returned an empty response.")
-    return append_sources_section(html, extract_cited_sources(response.content))
+    first_sources = extract_cited_sources(response.content)
+    try:
+        html = extract_html_document(extract_text_content(response.content))
+        return append_sources_section(html, first_sources)
+    except ValueError as first_error:
+        request["messages"].append({"role": "assistant", "content": response.content})
+        request["messages"].append(
+            {
+                "role": "user",
+                "content": f"{HTML_REPAIR_PROMPT}\n\nValidation error: {first_error}",
+            }
+        )
+
+    retry_response = create_anthropic_message(anthropic, request)
+    retry_search_errors = extract_web_search_errors(retry_response.content)
+    if retry_search_errors:
+        raise RuntimeError(f"Anthropic web search failed: {', '.join(retry_search_errors)}")
+
+    try:
+        html = extract_html_document(extract_text_content(retry_response.content))
+    except ValueError as retry_error:
+        raise RuntimeError(f"Anthropic returned invalid HTML after retry: {retry_error}") from retry_error
+
+    sources = merge_sources(first_sources, extract_cited_sources(retry_response.content))
+    return append_sources_section(html, sources)
 
 
 def resolve_file_download_url(client: Any, file_obj: dict[str, Any]) -> str:
@@ -875,7 +1151,12 @@ def create_slack_app(config: AppConfig) -> Any:
 
                 try:
                     say(f"Generating `{stored_name}` from attached sources...")
-                    html = generate_html(anthropic, config, build_prompt_with_sources(command.prompt, source_materials))
+                    html = generate_html(
+                        anthropic,
+                        config,
+                        build_prompt_with_sources(command.prompt, source_materials),
+                        command.filename,
+                    )
                     write_text_file(output_path, html)
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Failed to generate %s from source attachments", stored_name)
@@ -891,14 +1172,42 @@ def create_slack_app(config: AppConfig) -> Any:
             )
             return
 
-        command = parse_command(event.get("text"))
+        text = event.get("text") or ""
+        pending = get_pending_clarification(config, slack_user_id)
+        command = parse_command(text)
         if command is None:
             return
+        if pending and is_cancel_text(text):
+            clear_pending_clarification(config, slack_user_id)
+            say("Canceled the pending page request.")
+            return
         if command.kind == "help":
+            clear_pending_clarification(config, slack_user_id)
             say(HELP_TEXT)
+            return
+        if pending:
+            filename, clarified_prompt = build_prompt_from_clarification(pending, text)
+            stored_name = build_site_filename(slack_user_id, filename)
+            output_path = config.sites_dir / stored_name
+            clear_pending_clarification(config, slack_user_id)
+
+            try:
+                say(f"Generating `{stored_name}`...")
+                html = generate_html(anthropic, config, clarified_prompt, filename)
+                write_text_file(output_path, html)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to generate %s from clarification", stored_name)
+                say(f"Generation failed for `{stored_name}`: {exc}")
+                return
+
+            say(f"Published `{stored_name}`: {publish_url(config, stored_name)}")
             return
         if command.kind == "route":
             command = route_message_intent(anthropic, config, command.prompt or "")
+        if command.kind == "clarify":
+            set_pending_clarification(config, slack_user_id, command)
+            say(command.question or clarification_question_for(command.filename, command.prompt))
+            return
         if command.kind == "chat":
             try:
                 say(chat_with_claude(anthropic, config, command.prompt or ""))
@@ -914,7 +1223,7 @@ def create_slack_app(config: AppConfig) -> Any:
 
         try:
             say(f"Generating `{stored_name}`...")
-            html = generate_html(anthropic, config, command.prompt)
+            html = generate_html(anthropic, config, command.prompt, command.filename)
             write_text_file(output_path, html)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to generate %s", stored_name)
