@@ -16,6 +16,8 @@ TangoBot is in beta testing. Expect rough edges, and review generated pages befo
 - Keeps private version snapshots and supports `rollback` plus `history`.
 - Publishes files from a local `sites/` directory over Tailscale.
 - Replies with the tailnet URL for the saved page.
+- Streams Claude's chat replies into the same Slack message as they arrive and posts elapsed-time ticks while a page generates.
+- Sweeps old published pages on startup and hourly using `TANGOBOT_PAGE_TTL_DAYS` (default 90; set to `0` to disable).
 
 ## What v1 does not do
 
@@ -64,6 +66,8 @@ Copy `.env.example` to `.env` and fill in the values. `TAILSCALE_BASE_URL` is op
 `TANGOBOT_STATE_FILE` is optional. It defaults to `~/.tangobot/pending_clarifications.json` and stores pending one-question clarification flows across bot restarts.
 
 `TANGOBOT_HISTORY_FILE` and `TANGOBOT_VERSIONS_DIR` are optional. They default to `~/.tangobot/page_history.json` and `~/.tangobot/page_versions`. Version snapshots are stored outside `sites/`, so only the current live page is served.
+
+`TANGOBOT_PAGE_TTL_DAYS` controls how long published pages live in `sites/` before an automatic sweep deletes them. Defaults to `90`. Set it to `0` to disable the sweep. Cleanup runs once at startup and then at most once per hour while the bot is handling messages.
 
 The default model is `claude-sonnet-4-6`. For deeper reasoning at higher cost, set `ANTHROPIC_MODEL=claude-opus-4-6`.
 

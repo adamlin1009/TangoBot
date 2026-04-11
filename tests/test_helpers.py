@@ -7,6 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 
+_SUBMODULES = ("commands", "generation", "storage", "config", "tailscale")
+
+
 def _load_app_module():
     try:
         return importlib.import_module("app")
@@ -19,7 +22,16 @@ def _get_helper(module, *names):
         helper = getattr(module, name, None)
         if callable(helper):
             return helper
-    pytest.fail(f"None of these helpers exist on app: {', '.join(names)}")
+    for submodule_name in _SUBMODULES:
+        try:
+            submodule = importlib.import_module(submodule_name)
+        except ModuleNotFoundError:
+            continue
+        for name in names:
+            helper = getattr(submodule, name, None)
+            if callable(helper):
+                return helper
+    pytest.fail(f"None of these helpers exist on app or submodules: {', '.join(names)}")
 
 
 def _test_config(app, state_file=None, web_search_enabled=True, history_file=None, versions_dir=None, sites_dir=None):
@@ -80,6 +92,78 @@ class _StopReasonAnthropic:
         return SimpleNamespace(
             content=[{"type": "text", "text": text}],
             stop_reason=stop_reason,
+        )
+
+
+class _FakeStream:
+    def __init__(self, text, chunk_size):
+        self._text = text
+        self._chunk_size = chunk_size
+
+    @property
+    def text_stream(self):
+        for i in range(0, len(self._text), self._chunk_size):
+            yield self._text[i : i + self._chunk_size]
+
+    def get_final_message(self):
+        return SimpleNamespace(
+            content=[{"type": "text", "text": self._text}],
+            stop_reason="end_turn",
+        )
+
+
+class _FakeStreamContext:
+    def __init__(self, text, chunk_size):
+        self._text = text
+        self._chunk_size = chunk_size
+
+    def __enter__(self):
+        return _FakeStream(self._text, self._chunk_size)
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _StreamingAnthropic:
+    """Fake Anthropic client exposing both streaming and non-streaming interfaces."""
+
+    def __init__(self, responses, chunk_size=8):
+        self.messages = self
+        self.responses = list(responses)
+        self.chunk_size = chunk_size
+        self.requests = []
+
+    def stream(self, **kwargs):
+        self.requests.append(kwargs)
+        index = min(len(self.requests) - 1, len(self.responses) - 1)
+        return _FakeStreamContext(self.responses[index], self.chunk_size)
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        index = min(len(self.requests) - 1, len(self.responses) - 1)
+        return SimpleNamespace(
+            content=[{"type": "text", "text": self.responses[index]}],
+            stop_reason="end_turn",
+        )
+
+
+class _RateLimitingAnthropic:
+    """Raises rate-limit errors N times, then succeeds."""
+
+    def __init__(self, responses, failures_before_success):
+        self.messages = self
+        self.responses = list(responses)
+        self.failures_before_success = failures_before_success
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        if len(self.requests) <= self.failures_before_success:
+            raise RuntimeError("Error code: 429 - rate_limit_error")
+        index = min(len(self.requests) - 1 - self.failures_before_success, len(self.responses) - 1)
+        return SimpleNamespace(
+            content=[{"type": "text", "text": self.responses[index]}],
+            stop_reason="end_turn",
         )
 
 
@@ -1006,3 +1090,243 @@ def test_generation_rate_limit_message_is_user_friendly():
 
     assert "model rate limit" in message
     assert "429" not in message
+
+
+def test_cleanup_expired_pages_respects_ttl(tmp_path):
+    app = _load_app_module()
+    cleanup_expired_pages = _get_helper(app, "cleanup_expired_pages")
+
+    sites_dir = tmp_path / "sites"
+    sites_dir.mkdir()
+    fresh = sites_dir / "fresh.html"
+    stale = sites_dir / "stale.html"
+    fresh.write_text("fresh", encoding="utf-8")
+    stale.write_text("stale", encoding="utf-8")
+
+    import os as _os
+    ancient = fresh.stat().st_mtime - (10 * 86400)
+    _os.utime(stale, (ancient, ancient))
+
+    deleted = cleanup_expired_pages(sites_dir, ttl_days=5)
+
+    assert deleted == 1
+    assert fresh.exists()
+    assert not stale.exists()
+
+
+def test_cleanup_expired_pages_disabled_by_zero_ttl(tmp_path):
+    app = _load_app_module()
+    cleanup_expired_pages = _get_helper(app, "cleanup_expired_pages")
+
+    sites_dir = tmp_path / "sites"
+    sites_dir.mkdir()
+    (sites_dir / "old.html").write_text("old", encoding="utf-8")
+
+    assert cleanup_expired_pages(sites_dir, ttl_days=0) == 0
+    assert (sites_dir / "old.html").exists()
+
+
+def test_atomic_write_text_file_leaves_no_tmp_on_success(tmp_path):
+    app = _load_app_module()
+    write_text_file = _get_helper(app, "write_text_file")
+    target = tmp_path / "page.html"
+
+    write_text_file(target, "<!doctype html><html></html>")
+
+    assert target.read_text(encoding="utf-8") == "<!doctype html><html></html>"
+    assert not (tmp_path / "page.html.tmp").exists()
+
+
+def test_clarification_state_lock_serializes_concurrent_writers(tmp_path):
+    import threading
+
+    app = _load_app_module()
+    set_pending_clarification = _get_helper(app, "set_pending_clarification")
+    get_pending_clarification = _get_helper(app, "get_pending_clarification")
+    load_pending_clarifications = _get_helper(app, "load_pending_clarifications")
+    config = _test_config(app, state_file=tmp_path / "pending.json")
+
+    def writer(user_id: str) -> None:
+        set_pending_clarification(
+            config,
+            user_id,
+            app.Command(
+                kind="clarify",
+                filename=f"{user_id}-map.html",
+                prompt="make a map",
+                question="What market?",
+            ),
+        )
+
+    threads = [threading.Thread(target=writer, args=(f"U{i}",)) for i in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    state = load_pending_clarifications(config.state_file)
+    assert set(state.keys()) == {"U0", "U1", "U2", "U3", "U4"}
+    for user_id in ("U0", "U1", "U2", "U3", "U4"):
+        pending = get_pending_clarification(config, user_id)
+        assert pending["filename"] == f"{user_id}-map.html"
+
+
+def test_rate_limit_backoff_retries_and_succeeds(monkeypatch):
+    app = _load_app_module()
+    create_anthropic_message = _get_helper(app, "create_anthropic_message")
+    generation = importlib.import_module("generation")
+    monkeypatch.setattr(generation.time, "sleep", lambda _seconds: None)
+    fake = _RateLimitingAnthropic(["ok"], failures_before_success=2)
+
+    response = create_anthropic_message(
+        fake,
+        {"model": "m", "max_tokens": 100, "system": "s", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert len(fake.requests) == 3
+    assert response.content[0]["text"] == "ok"
+
+
+def test_rate_limit_backoff_gives_up_after_max_attempts(monkeypatch):
+    app = _load_app_module()
+    create_anthropic_message = _get_helper(app, "create_anthropic_message")
+    generation = importlib.import_module("generation")
+    monkeypatch.setattr(generation.time, "sleep", lambda _seconds: None)
+    fake = _RateLimitingAnthropic(["never"], failures_before_success=10)
+
+    with pytest.raises(RuntimeError, match="rate_limit_error"):
+        create_anthropic_message(
+            fake,
+            {"model": "m", "max_tokens": 100, "system": "s", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert len(fake.requests) == generation.RATE_LIMIT_MAX_ATTEMPTS_CREATE
+
+
+def test_rate_limit_backoff_does_not_retry_other_errors():
+    app = _load_app_module()
+    create_anthropic_message = _get_helper(app, "create_anthropic_message")
+
+    class _BrokenAnthropic:
+        def __init__(self):
+            self.messages = self
+            self.requests = []
+
+        def create(self, **kwargs):
+            self.requests.append(kwargs)
+            raise ValueError("invalid request payload")
+
+    fake = _BrokenAnthropic()
+
+    with pytest.raises(ValueError, match="invalid request payload"):
+        create_anthropic_message(
+            fake,
+            {"model": "m", "max_tokens": 100, "system": "s", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert len(fake.requests) == 1
+
+
+def test_chat_with_claude_streams_text_progress_to_callback():
+    app = _load_app_module()
+    chat_with_claude = _get_helper(app, "chat_with_claude")
+    fake = _StreamingAnthropic(["Hello there, friend."], chunk_size=5)
+    progress: list[str] = []
+
+    result = chat_with_claude(
+        fake,
+        _test_config(app, web_search_enabled=False),
+        "hi",
+        on_progress=progress.append,
+    )
+
+    assert result == "Hello there, friend."
+    assert len(progress) >= 2
+    # Each progress update must be a prefix of the final text and grow monotonically.
+    for previous, current in zip(progress, progress[1:]):
+        assert current.startswith(previous) or len(current) >= len(previous)
+    assert progress[-1] == "Hello there, friend."
+
+
+def test_stream_anthropic_message_emits_ticks_on_injected_clock():
+    generation = importlib.import_module("generation")
+    fake = _StreamingAnthropic(["abcdefghij"], chunk_size=2)  # 5 deltas
+    clock_values = iter([0.0, 1.0, 3.0, 6.0, 11.0, 17.0, 17.0])
+
+    def fake_clock() -> float:
+        return next(clock_values)
+
+    events: list = []
+
+    generation.stream_anthropic_message(
+        fake,
+        {"model": "m", "max_tokens": 100, "system": "s", "messages": [{"role": "user", "content": "hi"}]},
+        on_progress=events.append,
+        tick_interval=5.0,
+        clock=fake_clock,
+    )
+
+    tick_events = [event for event in events if event.kind == "tick"]
+    assert tick_events, "expected at least one tick event"
+    # Ticks must have monotonically increasing elapsed time.
+    tick_elapsed = [event.elapsed_seconds for event in tick_events]
+    assert tick_elapsed == sorted(tick_elapsed)
+
+
+def test_generate_html_forwards_tick_progress_to_updater(monkeypatch):
+    app = _load_app_module()
+    generate_html = _get_helper(app, "generate_html")
+    generation = importlib.import_module("generation")
+    valid_html = "<!doctype html><html><head><title>T</title></head><body><h1>T</h1></body></html>"
+
+    # Force stream_anthropic_message to emit one tick event so the callback sees a progress string.
+    def fake_stream(anthropic, request, *, on_progress=None, tick_interval=5.0, clock=None):
+        anthropic.requests.append(request)
+        if on_progress is not None:
+            on_progress(generation.StreamEvent(kind="tick", text_so_far="", elapsed_seconds=7.0))
+        return SimpleNamespace(content=[{"type": "text", "text": valid_html}], stop_reason="end_turn")
+
+    monkeypatch.setattr(generation, "stream_anthropic_message", fake_stream)
+
+    fake = _StreamingAnthropic([valid_html])
+    progress: list[str] = []
+    html = generate_html(
+        fake,
+        _test_config(app, web_search_enabled=False),
+        "landscape",
+        "market-map.html",
+        on_progress=progress.append,
+    )
+
+    assert html == valid_html
+    assert progress, "expected on_progress to receive at least one tick update"
+    assert "market-map.html" in progress[0]
+    assert "elapsed" in progress[0]
+
+
+def test_router_narrower_exception_propagates_unexpected_errors():
+    app = _load_app_module()
+    route_message_intent = _get_helper(app, "route_message_intent")
+
+    class _KeyErrorAnthropic:
+        def __init__(self):
+            self.messages = self
+            self.requests = []
+
+        def create(self, **kwargs):
+            self.requests.append(kwargs)
+            raise KeyError("unexpected")
+
+    with pytest.raises(KeyError):
+        route_message_intent(_KeyErrorAnthropic(), _test_config(app), "make a map")
+
+
+def test_router_falls_back_on_json_decode_errors():
+    app = _load_app_module()
+    route_message_intent = _get_helper(app, "route_message_intent")
+    fake = _FakeAnthropic("this is not json at all")
+
+    command = route_message_intent(fake, _test_config(app), "hello there")
+
+    assert command.kind == "chat"
+    assert command.prompt == "hello there"
