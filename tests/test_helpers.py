@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -655,6 +656,30 @@ def test_web_search_tools_are_omitted_when_disabled():
     assert web_search_tools(config) == []
 
 
+def test_load_config_clamps_generation_max_tokens(monkeypatch, tmp_path):
+    config_module = importlib.import_module("config")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("TAILSCALE_BASE_URL", "https://example.ts.net")
+    monkeypatch.setenv("SITES_DIR", str(tmp_path / "sites"))
+    monkeypatch.setenv("TANGOBOT_STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("TANGOBOT_HISTORY_FILE", str(tmp_path / "history.json"))
+    monkeypatch.setenv("TANGOBOT_VERSIONS_DIR", str(tmp_path / "versions"))
+
+    monkeypatch.delenv("ANTHROPIC_GENERATION_MAX_TOKENS", raising=False)
+    assert config_module.load_config().generation_max_tokens == config_module.GENERATION_MAX_TOKENS
+
+    monkeypatch.setenv("ANTHROPIC_GENERATION_MAX_TOKENS", "4096")
+    assert config_module.load_config().generation_max_tokens == config_module.MIN_GENERATION_MAX_TOKENS
+
+    monkeypatch.setenv("ANTHROPIC_GENERATION_MAX_TOKENS", "24576")
+    assert config_module.load_config().generation_max_tokens == 24576
+
+    monkeypatch.setenv("ANTHROPIC_GENERATION_MAX_TOKENS", "999999")
+    assert config_module.load_config().generation_max_tokens == config_module.MAX_GENERATION_MAX_TOKENS
+
+
 def test_chat_with_claude_truncates_large_prompt_input():
     app = _load_app_module()
     chat_with_claude = _get_helper(app, "chat_with_claude")
@@ -898,6 +923,127 @@ def test_revise_published_page_keeps_url_and_increments_version(tmp_path):
     assert "Current live HTML" in sent_prompt
 
 
+def test_revise_published_page_applies_patch_first(tmp_path):
+    app = _load_app_module()
+    record_page_publish = _get_helper(app, "record_page_publish")
+    revise_published_page = _get_helper(app, "revise_published_page")
+    config_module = importlib.import_module("config")
+    sites_dir = tmp_path / "sites"
+    config = _test_config(
+        app,
+        history_file=tmp_path / "history.json",
+        versions_dir=tmp_path / "versions",
+        sites_dir=sites_dir,
+        web_search_enabled=False,
+    )
+    stored_name = "U12345-market-map.html"
+    original_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Old</h1></body></html>"
+    live_path = sites_dir / stored_name
+    live_path.parent.mkdir(parents=True)
+    live_path.write_text(original_html, encoding="utf-8")
+    record_page_publish(config, "U12345", "market-map.html", stored_name, original_html, "make a map")
+
+    patch = json.dumps(
+        {
+            "operations": [
+                {"op": "replace", "old": "<h1>Old</h1>", "new": "<h1>New</h1>"},
+            ],
+            "fallback": None,
+        }
+    )
+    fake_anthropic = _SequenceAnthropic([patch])
+    entry = revise_published_page(fake_anthropic, config, "U12345", "market-map.html", "change old to new")
+
+    assert entry["current_version"] == 2
+    assert live_path.read_text(encoding="utf-8") == (
+        "<!doctype html><html><head><title>Map</title></head><body><h1>New</h1></body></html>"
+    )
+    assert len(fake_anthropic.requests) == 1
+    assert fake_anthropic.requests[0]["max_tokens"] == config_module.REVISION_PATCH_MAX_TOKENS
+    assert "JSON operations only" in fake_anthropic.requests[0]["messages"][0]["content"]
+
+
+def test_revision_patch_insert_operations():
+    app = _load_app_module()
+    apply_revision_operations = _get_helper(app, "apply_revision_operations")
+    html = "<!doctype html><html><head><title>Map</title></head><body><main><h1>Map</h1></main></body></html>"
+
+    patched = apply_revision_operations(
+        html,
+        [
+            {"op": "insert_before", "anchor": "<h1>Map</h1>", "content": "<p>Before</p>"},
+            {"op": "insert_after", "anchor": "<h1>Map</h1>", "content": "<p>After</p>"},
+        ],
+    )
+
+    assert "<p>Before</p><h1>Map</h1><p>After</p>" in patched
+
+
+def test_revision_patch_ambiguous_anchor_falls_back_to_full_replacement(tmp_path):
+    app = _load_app_module()
+    record_page_publish = _get_helper(app, "record_page_publish")
+    revise_published_page = _get_helper(app, "revise_published_page")
+    sites_dir = tmp_path / "sites"
+    config = _test_config(
+        app,
+        history_file=tmp_path / "history.json",
+        versions_dir=tmp_path / "versions",
+        sites_dir=sites_dir,
+        web_search_enabled=False,
+    )
+    stored_name = "U12345-market-map.html"
+    original_html = "<!doctype html><html><head><title>Map</title></head><body><p>Old</p><p>Old</p></body></html>"
+    revised_html = "<!doctype html><html><head><title>Map</title></head><body><p>New</p></body></html>"
+    live_path = sites_dir / stored_name
+    live_path.parent.mkdir(parents=True)
+    live_path.write_text(original_html, encoding="utf-8")
+    record_page_publish(config, "U12345", "market-map.html", stored_name, original_html, "make a map")
+
+    patch = json.dumps(
+        {
+            "operations": [
+                {"op": "replace", "old": "<p>Old</p>", "new": "<p>New</p>"},
+            ],
+            "fallback": None,
+        }
+    )
+    fake_anthropic = _SequenceAnthropic([patch, revised_html])
+
+    revise_published_page(fake_anthropic, config, "U12345", "market-map.html", "change old to new")
+
+    assert live_path.read_text(encoding="utf-8") == revised_html
+    assert len(fake_anthropic.requests) == 2
+    assert "Revise the existing published HTML page" in fake_anthropic.requests[1]["messages"][0]["content"]
+
+
+def test_broad_revision_skips_patch_and_uses_full_replacement_budget(tmp_path):
+    app = _load_app_module()
+    record_page_publish = _get_helper(app, "record_page_publish")
+    revise_published_page = _get_helper(app, "revise_published_page")
+    sites_dir = tmp_path / "sites"
+    config = _test_config(
+        app,
+        history_file=tmp_path / "history.json",
+        versions_dir=tmp_path / "versions",
+        sites_dir=sites_dir,
+        web_search_enabled=False,
+    )
+    stored_name = "U12345-market-map.html"
+    original_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Old</h1></body></html>"
+    revised_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Redesigned</h1></body></html>"
+    live_path = sites_dir / stored_name
+    live_path.parent.mkdir(parents=True)
+    live_path.write_text(original_html, encoding="utf-8")
+    record_page_publish(config, "U12345", "market-map.html", stored_name, original_html, "make a map")
+    fake_anthropic = _SequenceAnthropic([revised_html])
+
+    revise_published_page(fake_anthropic, config, "U12345", "market-map.html", "redesign from scratch")
+
+    assert live_path.read_text(encoding="utf-8") == revised_html
+    assert len(fake_anthropic.requests) == 1
+    assert fake_anthropic.requests[0]["max_tokens"] == config.generation_max_tokens
+
+
 def test_generate_html_returns_valid_first_response_without_retry():
     app = _load_app_module()
     generate_html = _get_helper(app, "generate_html")
@@ -918,7 +1064,19 @@ def test_generate_html_uses_larger_output_budget():
 
     generate_html(fake_anthropic, _test_config(app), "enterprise AI landscape", "market-map.html")
 
-    assert fake_anthropic.requests[0]["max_tokens"] >= 8192
+    assert fake_anthropic.requests[0]["max_tokens"] >= 32768
+
+
+def test_generate_html_uses_configured_output_budget():
+    app = _load_app_module()
+    generate_html = _get_helper(app, "generate_html")
+    valid_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Market Map</h1></body></html>"
+    fake_anthropic = _SequenceAnthropic([valid_html])
+    config = replace(_test_config(app), generation_max_tokens=24576)
+
+    generate_html(fake_anthropic, config, "enterprise AI landscape", "market-map.html")
+
+    assert fake_anthropic.requests[0]["max_tokens"] == 24576
 
 
 def test_generate_html_does_not_send_web_search_tools_when_disabled():
@@ -979,13 +1137,35 @@ def test_generate_html_retries_once_after_invalid_response():
     assert all(message["role"] != "assistant" for message in fake_anthropic.requests[1]["messages"])
 
 
-def test_generate_html_repair_compacts_after_output_token_limit():
+def test_generate_html_continues_after_output_token_limit():
+    app = _load_app_module()
+    generate_html = _get_helper(app, "generate_html")
+    first_chunk = "<!doctype html><html><head><title>Map</title></head><body><h1>Market"
+    second_chunk = " Map</h1></body></html>"
+    fake_anthropic = _StopReasonAnthropic(
+        [
+            (first_chunk, "max_tokens"),
+            (second_chunk, "end_turn"),
+        ]
+    )
+
+    html = generate_html(fake_anthropic, _test_config(app), "enterprise AI landscape", "market-map.html")
+
+    assert html == first_chunk + second_chunk
+    assert len(fake_anthropic.requests) == 2
+    assert fake_anthropic.requests[1]["messages"][-1]["content"].startswith("Continue the same HTML document")
+    assert any(message["role"] == "assistant" for message in fake_anthropic.requests[1]["messages"])
+
+
+def test_generate_html_repair_compacts_after_continuation_token_limit():
     app = _load_app_module()
     generate_html = _get_helper(app, "generate_html")
     incomplete_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Market Map</h1>"
     valid_html = "<!doctype html><html><head><title>Map</title></head><body><h1>Compact Map</h1></body></html>"
     fake_anthropic = _StopReasonAnthropic(
         [
+            (incomplete_html, "max_tokens"),
+            (incomplete_html, "max_tokens"),
             (incomplete_html, "max_tokens"),
             (valid_html, "end_turn"),
         ]
@@ -994,10 +1174,10 @@ def test_generate_html_repair_compacts_after_output_token_limit():
     html = generate_html(fake_anthropic, _test_config(app), "enterprise AI landscape", "market-map.html")
 
     assert html == valid_html
-    retry_prompt = fake_anthropic.requests[1]["messages"][-1]["content"]
+    retry_prompt = fake_anthropic.requests[3]["messages"][-1]["content"]
     assert "output token limit" in retry_prompt
     assert "shorter version" in retry_prompt
-    assert all(message["role"] != "assistant" for message in fake_anthropic.requests[1]["messages"])
+    assert all(message["role"] != "assistant" for message in fake_anthropic.requests[3]["messages"])
 
 
 def test_generate_html_reports_output_token_limit_after_retry():
@@ -1011,7 +1191,7 @@ def test_generate_html_reports_output_token_limit_after_retry():
         ]
     )
 
-    with pytest.raises(RuntimeError, match="output token limit"):
+    with pytest.raises(RuntimeError, match="too large to complete"):
         generate_html(fake_anthropic, _test_config(app), "enterprise AI landscape", "market-map.html")
 
 

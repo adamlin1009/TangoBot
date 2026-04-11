@@ -64,6 +64,8 @@ Copy `.env.example` to `.env` and fill in the values. `TAILSCALE_BASE_URL` is op
 
 `ANTHROPIC_WEB_SEARCH=0` is the default. This keeps broad page-generation prompts smaller and avoids search/tool context inflating token usage. If you explicitly want live web research, set `ANTHROPIC_WEB_SEARCH=1` and keep `ANTHROPIC_WEB_SEARCH_MAX_USES` low.
 
+`ANTHROPIC_GENERATION_MAX_TOKENS` controls the output budget for generated and fully regenerated HTML pages. It defaults to `32768` and is clamped between `8192` and `64000`. Higher values can help very large pages finish, but they also increase latency and rate-limit pressure.
+
 `TANGOBOT_STATE_FILE` is optional. It defaults to `~/.tangobot/pending_clarifications.json` and stores pending one-question clarification flows across bot restarts.
 
 `TANGOBOT_HISTORY_FILE` and `TANGOBOT_VERSIONS_DIR` are optional. They default to `~/.tangobot/page_history.json` and `~/.tangobot/page_versions`. Version snapshots are stored outside `sites/`, so only the current live page is served.
@@ -177,7 +179,7 @@ history                       → list your recent pages and versions
 ## Notes
 
 - Filenames are automatically prefixed with the Slack user ID to avoid collisions.
-- Revisions keep the same published URL; old versions are private files used only for rollback.
+- Revisions keep the same published URL; old versions are private files used only for rollback. Most revisions are applied as targeted patches first, with full-page regeneration used for broad redesigns or unsafe patches.
 - Model inputs are capped before Anthropic calls. Long Slack messages, route-classification input, and uploaded source material are truncated to avoid bloating context and hitting token-per-minute limits.
 - The host machine must stay online for pages to remain reachable.
 - Access is limited to users on the tailnet.
