@@ -1,12 +1,17 @@
-import fcntl
 import json
 import logging
 import os
 import re
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 from commands import (
     Command,
@@ -33,13 +38,26 @@ def write_text_file(path: Path, content: str) -> None:
 def file_lock(state_file: Path) -> Iterator[None]:
     lock_path = state_file.with_suffix(state_file.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.touch(exist_ok=True)
-    with open(lock_path, "r+") as lock_handle:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    # Windows msvcrt.locking locks a byte range, so the lock file must have
+    # at least one byte. Writing a single NUL byte is a harmless no-op on
+    # POSIX.
+    if not lock_path.exists() or lock_path.stat().st_size == 0:
+        lock_path.write_bytes(b"\0")
+    with open(lock_path, "r+b") as lock_handle:
+        if sys.platform == "win32":
+            lock_handle.seek(0)
+            msvcrt.locking(lock_handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_handle.seek(0)
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def load_pending_clarifications(state_file: Path) -> dict[str, dict[str, Any]]:
