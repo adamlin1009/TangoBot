@@ -7,17 +7,18 @@ TangoBot is in beta testing. Expect rough edges, and review generated pages befo
 ## What v1 does
 
 - Accepts Slack DMs only.
-- Supports natural-language generation requests, `generate <filename>.html <prompt>`, and `help`.
-- Asks one clarification question for thin page requests before generating.
-- Accepts `.html` file uploads and saves them directly.
-- Accepts `.jsx` React component uploads and publishes both the source and a runnable `.html` page.
-- Accepts `.txt`, `.md`, `.csv`, and `.json` uploads as source material for generation.
-- Revises the last published page or an explicitly named page while keeping the same URL.
-- Keeps private version snapshots and supports `rollback` plus `history`.
-- Publishes files from a local `sites/` directory over Tailscale.
-- Replies with the tailnet URL for the saved page.
-- Streams Claude's chat replies into the same Slack message as they arrive and posts elapsed-time ticks while a page generates.
-- Sweeps old published pages on startup and hourly using `TANGOBOT_PAGE_TTL_DAYS` (default 90; set to `0` to disable).
+- Chats with Claude for general questions, summaries, brainstorming, and analysis — replies stream into the same Slack message as the model generates them.
+- Generates self-contained HTML pages from natural-language requests or explicit `generate <filename>.html <prompt>` commands and hosts them on the tailnet.
+- Shows elapsed-time ticks (`Generating foo.html — 15s elapsed...`) in place of the "Thinking..." placeholder while a page is being built.
+- Asks one clarification question when a page request is too thin, then treats the next DM as the answer. `cancel` clears a pending clarification.
+- Accepts uploaded `.html` files and publishes them directly.
+- Accepts uploaded `.jsx` React components (single-file, no imports) and publishes both the source and a runnable `.html` page that loads React, ReactDOM, and Babel from CDNs.
+- Accepts uploaded `.txt`, `.md`, `.csv`, and `.json` files as source material for the same message's generation request.
+- Revises published pages in place from natural-language instructions (`revise it to ...`, `add a ...`, `make it more ...`) while keeping the live URL stable.
+- Keeps a private version history for every published page and supports `rollback` and `history` commands.
+- Publishes files from a local `sites/` directory over Tailscale Serve and replies with the tailnet URL.
+- Retries transient Anthropic rate-limit errors automatically with exponential backoff.
+- Sweeps published pages older than `TANGOBOT_PAGE_TTL_DAYS` (default 90; `0` disables) on startup and hourly during normal operation.
 
 ## What v1 does not do
 
@@ -83,28 +84,95 @@ The script reads `.env` from the repo root, ensures the local sites directory ex
 
 ## Usage
 
-Send the bot a DM in one of these forms:
+TangoBot only listens to direct messages. Start a DM with the bot and say `help` (or `guide` / `usage`) at any time to see the in-bot usage guide. The sections below mirror the commands you will actually use day-to-day.
+
+### Chat with Claude
+
+Ask a question, summarize a document, compare options, or brainstorm — any message that is not a recognized command and does not look like a page-generation request is treated as chat.
 
 ```text
-help
-what can you help me build?
-summarize these customer notes into themes
-generate market-map.html enterprise AI landscape with columns for category, company, funding, and stage
-generate market-map.html
-revise it to make the layout cleaner
-revise market-map.html add a funding stage column
-rollback
-history
-make me a market map for the enterprise AI landscape with buyer categories and vendor examples
+what are three ways to pitch our pricing page to a skeptical CFO?
+summarize these customer notes into themes and action items
+```
+
+Replies stream into the same Slack message as they arrive. You will see the answer grow in place instead of waiting for a single long reply at the end.
+
+### Generate and host a page
+
+Describe the page you want. The bot picks a readable filename, generates a self-contained HTML page, writes it into the `sites/` directory, and replies with the tailnet URL. While it works, the "Thinking..." placeholder is replaced with elapsed-time ticks like `Generating market-map.html — 15s elapsed...` so you know it is still running.
+
+Natural-language requests:
+
+```text
 make me a marketplace map for enterprise AI with categories and vendor examples
+build a pricing dashboard for our Q2 packaging options
 create market-map.html for the enterprise AI landscape with categories and vendor examples
 ```
 
-For natural-language requests, the bot picks a readable filename and asks Claude to infer a complete page structure with illustrative content. If a request is too thin, such as only a filename, an artifact type without a subject, or a broad market-map request without enough detail, the bot asks one clarification question and uses the next DM reply to generate the page. Reply `cancel` to clear a pending clarification. You can also paste source notes, lists, or URLs directly into the message.
+Explicit filename and prompt:
 
-If a user uploads an `.html` file in a DM, the bot saves it and returns the tailnet URL. If a user uploads a `.jsx` file, it must be one self-contained React component using global `React`; the bot saves the `.jsx` source and publishes a wrapped `.html` page that loads React, ReactDOM, and Babel from CDNs. If a user uploads `.txt`, `.md`, `.csv`, or `.json` files with a request, the bot uses those files as source material for the generated page.
+```text
+generate market-map.html enterprise AI landscape with columns for category, company, funding, and stage
+```
 
-After a page is published, reply with natural revision instructions such as `make it more executive`, `add a pricing section`, or `revise market-map.html use a cleaner layout`. Revisions update the same live URL and save private snapshots for rollback. Use `rollback` to restore the previous version of the last page, or `history` to list recent pages and version numbers.
+Filename only, which triggers a clarification question on the next DM:
+
+```text
+generate market-map.html
+```
+
+If the bot decides a request is too thin (for example, just a filename, or a broad "market map" without a topic), it will ask one clarification question and use the next DM reply as the answer. Send `cancel` to clear a pending question without generating anything.
+
+### Use your own source material
+
+You can paste notes, company lists, links, or data directly into the DM alongside a page request — the bot will use that text as the primary source for the generated page.
+
+You can also attach one or more `.txt`, `.md`, `.csv`, or `.json` files with the same message. The bot reads the uploaded files, truncates them to a safe size, and feeds them into the generation prompt. Example:
+
+```text
+[attach customers.csv and strategy-notes.md]
+build a one-page customer health dashboard using these files
+```
+
+### Upload existing HTML or JSX files
+
+Drop a single `.html` file into the DM and the bot publishes it directly and returns a URL. No editing, no rewriting.
+
+Drop a single `.jsx` React component and the bot validates it (one file, no `import`/`require`/`export` statements), saves the raw JSX, and publishes a wrapped `.html` page that loads React 18, ReactDOM, and Babel standalone from a CDN and renders your component into `#root`. The component must reference `React` globally rather than importing it.
+
+### Revise a published page in place
+
+After a page is published, send natural-language revision instructions in the same DM thread. The bot updates the same URL, saves the old version privately for rollback, and replies with the same link.
+
+```text
+revise it to make the layout cleaner
+add a funding stage column
+make it more executive
+revise market-map.html add a pricing section
+```
+
+The unnamed form (`revise it ...`, `add ...`, `make it ...`) targets your most recently published page. The named form (`revise <filename>.html ...`) lets you revise a specific page out of order.
+
+### Rollback and version history
+
+Every publish and revision saves a private snapshot. Old snapshots are stored outside `sites/` so only the current live page is served on the tailnet.
+
+- `rollback` restores the previous version of your most recent page.
+- `rollback market-map.html` restores the previous version of a specific page.
+- `history` lists your recent pages with version counts and the last update time.
+
+### Cheat sheet
+
+```text
+help / guide / usage          → show in-bot usage guide
+cancel                        → clear a pending clarification
+generate <file>.html <prompt> → explicit page generation
+revise <file>.html <prompt>   → revise a specific page
+revise it ... / add ...       → revise the most recent page
+rollback                      → restore previous version of last page
+rollback <file>.html          → restore previous version of a specific page
+history                       → list your recent pages and versions
+```
 
 ## Notes
 
